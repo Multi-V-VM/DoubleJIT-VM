@@ -23,7 +23,7 @@ impl<'a> Binary<'a> {
     pub fn parse(bytes: &'a [u8]) -> ParseResult<Self> {
         let mut elf = ElfFile::new(bytes).unwrap();
         let pages = Vec::new();
-
+        // jitedly translate instruction to flatmap, and map memory to linear memory
         unsafe {
             match elf.header_part1.get_class() {
                 Class::ThirtyTwo => BIT_LENGTH = 0,

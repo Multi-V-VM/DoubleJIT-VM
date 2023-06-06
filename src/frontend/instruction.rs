@@ -1427,20 +1427,18 @@ fn try_from_compressed(bit: &[u8]) -> Option<Instruction> {
                             // Reserved
                             None
                         }
+                    } else if rd != 0 {
+                        // C.MV
+                        Some(rv32!(
+                            RV32I,
+                            ADD,
+                            Rd(Reg::X(Xx::new(rd))),
+                            Rs1(Reg::X(Xx::new(0))),
+                            Rs2(Reg::X(Xx::new(rs2)))
+                        ))
                     } else {
-                        if rd != 0 {
-                            // C.MV
-                            Some(rv32!(
-                                RV32I,
-                                ADD,
-                                Rd(Reg::X(Xx::new(rd))),
-                                Rs1(Reg::X(Xx::new(0))),
-                                Rs2(Reg::X(Xx::new(rs2)))
-                            ))
-                        } else {
-                            // HINTs
-                            Some(Instr::NOP)
-                        }
+                        // HINTs
+                        Some(Instr::NOP)
                     }
                 }
                 0b1_00000_00000_00 => {
@@ -2827,5 +2825,18 @@ mod tests {
                 Rs2(Reg::X(Xx::new(0)))
             )))
         );
+    }
+    #[test]
+    fn test_rvv() {
+        let instr_asm: u32 = 0b10010000000000000000001110011;
+        let instr = Instruction::parse(&instr_asm.to_le_bytes());
+        dbg!(instr.clone());
+        // assert_eq!(
+        //     instr.instr,
+        //     Instr::RV64(RV64Instr::RV64V(RV64V::(
+        //         Rs1(Reg::X(Xx::new(0))),
+        //         Rs2(Reg::X(Xx::new(0)))
+        //     )))
+        // );
     }
 }

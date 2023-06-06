@@ -1,0 +1,24 @@
+[package]
+name = "doublejit-vm-fuzz"
+version = "0.0.1"
+authors = ["Yiwei Yang <victoryang00@ucsc.edu>"]
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4.6"
+bytes = "1.4.0"
+doublejit-vm = { path = ".." }
+
+# Prevent this from interfering with workspaces
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "asm"
+path = "fuzz_targets/asm.rs"
+test = false
+doc = false

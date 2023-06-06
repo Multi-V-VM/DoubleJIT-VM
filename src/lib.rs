@@ -9,6 +9,7 @@ extern crate std;
 mod cache;
 mod codegen;
 mod frontend;
+mod middleend;
 mod runtime;
 mod tools;
 mod wasm;

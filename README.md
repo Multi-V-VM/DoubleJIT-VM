@@ -4,9 +4,9 @@ MVVM is a double JIT VM from RiscV assembly or elf to wasm, with all linux imple
 ### Frontend 
 Parse the elf, map the page to a linear memory defined in WebAssembly, interpret code with code cache. Refer a lot from [ria-jit](https://github.com/ria-jit/ria-jit), [riscv-jit-emulator](https://github.com/programmerjake/riscv-jit-emulator), [ckb-vm](https://github.com/nervosnetwork/ckb-vm/) and [valheim](https://github.com/imkiva/valheim/)
 ### Middleend
-From riscv to WebAssembly. use the wasmtime currently, implement a LLVMOpaqueExecutionEngine like JIT interface and apply the runtime using wasi. map the register to WebAssembly Model. Refer a lot from [v86]()
+From riscv to WebAssembly. use the wasmtime currently, implement a LLVMOpaqueExecutionEngine/FastJIT like JIT interface and apply the runtime using (WASIX)[https://github.com/wasix-org/wasix-libc]. map the register to stack based WebAssembly Model.
 ## Backend
-From WebAssembly to riscv. register guided optimzer and code cache optimzation.
+From WebAssembly to x86. register guided optimzer and code cache optimzation, codegen
 ## Comparison of WebAssembly and RISC-V
 1. Code/Data Separation
 
@@ -50,10 +50,11 @@ A Turing-complete calculator requires at least one conditional branch instructio
 LL/SC has stronger semantics than CAS, which suffers from intractable ABA issues, but LL/SC does not. This also means that it is much more difficult to simulate LL/SC on a CAS architecture than vice versa.
 
 ## Features
-- [ ] qemu like API
-- [ ] libc wasm wrapper
+- [ ] qemu-user like API
+- [ ] wasix compatibility
 - [ ] JIT RV64IMACGVF ISA to wasm
 - [ ] doubly JIT codebase infrastructure
+- [ ] rvv to wasm simd
 
 ### WIP ideas
 - [ ] 🚧 Lazy loaded memory?
