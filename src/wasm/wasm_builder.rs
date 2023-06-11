@@ -1,0 +1,1 @@
+use wasmer_compiler_cranelift::CraneliftCompiler;

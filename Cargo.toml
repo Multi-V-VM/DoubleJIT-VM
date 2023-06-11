@@ -22,6 +22,4 @@ crate-type = ["cdylib", "rlib"]
 name = "doublejit-runner"
 
 [package.metadata.docs.rs]
-# all-features = true
-rustc-args = ["--cfg", "madsim"]
-rustdoc-args = ["--cfg", "madsim", "--cfg", "docsrs"]
+all-features = true
