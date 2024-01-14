@@ -12,9 +12,9 @@ getrandom = {version = "0.2", features = ["js"]}
 wasm-bindgen = "0.2"
 wasm-bindgen-test = "0.3.30"
 # wasmer = {git = "https://github.com/Multi-V-VM/wasmer"}
-wasmer-compiler-cranelift = {path = "../wasmer/lib/compiler-cranelift"}
+wasmer = "4.2.5"
 zero = "0.1.2"
-
+wasmer-compiler-cranelift = "4.2.5"
 [lib]
 crate-type = ["cdylib", "rlib"]
 

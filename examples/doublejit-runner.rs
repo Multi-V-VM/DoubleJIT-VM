@@ -8,5 +8,5 @@ fn main(){
     )))
     .unwrap();
     // middle end, invoke native and have lock to prevent execution
-    
+    // let mut middleend = MiddleEnd::new();
 }

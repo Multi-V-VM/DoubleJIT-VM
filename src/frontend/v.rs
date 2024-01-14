@@ -1,4 +1,5 @@
 use crate::frontend::VLEN;
+use crate::frontend::ELEN;
 
 pub struct V {
     vstart: u64,

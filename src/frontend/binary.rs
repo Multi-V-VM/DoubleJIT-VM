@@ -135,9 +135,9 @@ impl<'a> Binary<'a> {
         );
         section_iter.next();
         for sh in section_iter {
-            dbg!(" {}", sh.get_data(&elf));
+            dbg!(" {},", sh.get_data(&elf));
         }
-
+        
         Ok(Self { pages })
     }
 }

@@ -1221,7 +1221,7 @@ impl ProgramHeader32 {
         }
     }
     pub fn get_data<'a>(&self, elf: &ElfFile<'a>) -> ParseResult<SegmentData<'a>> {
-        self.get_type().map(|typ| match typ {
+        let _ = self.get_type().map(|typ| match typ {
             ProgramHeaderType::Null => SegmentData::Empty,
             ProgramHeaderType::Dynamic => {
                 let data = self.raw_data(elf);
@@ -1273,7 +1273,7 @@ impl ProgramHeader64 {
         }
     }
     pub fn get_data<'a>(&self, elf: &ElfFile<'a>) -> ParseResult<SegmentData<'a>> {
-        self.get_type().map(|typ| match typ {
+        let _ = self.get_type().map(|typ| match typ {
             ProgramHeaderType::Null => SegmentData::Empty,
             ProgramHeaderType::Dynamic => {
                 let data = self.raw_data(elf);

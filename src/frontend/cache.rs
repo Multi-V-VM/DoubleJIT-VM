@@ -17,5 +17,5 @@ impl CodeCache {
     }
     pub fn set(&mut self, addr: u64, instruction: Instruction) {
         self.cache.insert(addr, instruction);
-    }
+    } // cache for function and cache for instruction
 }
