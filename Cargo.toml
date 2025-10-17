@@ -8,13 +8,13 @@ name = "doublejit_vm"
 version = "0.1.0"
 [dependencies]
 bytemuck = "1.9.1"
-getrandom = {version = "0.2", features = ["js"]}
-wasm-bindgen = "0.2"
-wasm-bindgen-test = "0.3.30"
+getrandom = "0.3.4"
+wasm-bindgen = "0.2.104"
+wasm-bindgen-test = "0.3.54"
 # wasmer = {git = "https://github.com/Multi-V-VM/wasmer"}
-wasmer = "4.2.5"
+wasmer = "6.1.0"
 zero = "0.1.2"
-wasmer-compiler-cranelift = "4.2.5"
+wasmer-compiler-cranelift = "6.1.0"
 [lib]
 crate-type = ["cdylib", "rlib"]
 
