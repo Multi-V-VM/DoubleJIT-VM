@@ -22,3 +22,15 @@ name = "asm"
 path = "fuzz_targets/asm.rs"
 test = false
 doc = false
+
+[[bin]]
+name = "vector_instructions"
+path = "fuzz_targets/vector_instructions.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "instruction_stream"
+path = "fuzz_targets/instruction_stream.rs"
+test = false
+doc = false
