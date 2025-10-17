@@ -8,7 +8,7 @@ extern crate std;
 
 mod codegen;
 pub mod frontend;
-mod middleend;
+pub mod middleend;
+pub mod backend;
 mod runtime;
 mod tools;
-mod wasm;
