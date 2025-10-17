@@ -875,30 +875,30 @@ impl<'a> SectionHeader<'a> {
 pub struct SectionHeader_<P> {
     ///	contains the offset, in bytes, to the section name, relative to the start of the section
     /// name string table.
-    name: u32,
+    pub name: u32,
     /// identifies the section type.
-    section_type: u32,
+    pub section_type: u32,
     /// identifies the attributes of the section.
-    flags: P,
+    pub flags: P,
     /// contains the virtual address of the beginning of the section in memory. If the section is
     /// not allocated to the memory image of the program, this field should be zero.
-    address: P,
+    pub address: P,
     /// contains the offset, in bytes, of the beginning of the section contents in the file.
-    offset: P,
+    pub offset: P,
     /// contains the size, in bytes, of the section. Except for ShtNoBits sections, this is the
     /// amount of space occupied in the file.
-    size: P,
+    pub size: P,
     /// contains the section index of an associated section. This field is used for several
     /// purposes, depending on the type of section, as explained in Table 10.
-    link: u32,
+    pub link: u32,
     /// contains extra information about the section. This field is used for several purposes,
     /// depending on the type of section, as explained in Table 11.
-    info: u32,
+    pub info: u32,
     /// contains the required alignment of the section. This field must be a power of two.
-    alignment: P,
+    pub alignment: P,
     /// contains the size, in bytes, of each entry, for sections that contain fixed-size entries.
     /// Otherwise, this field contains zero.
-    entry_size: P,
+    pub entry_size: P,
 }
 
 impl<P> SectionHeader_<P> {}
