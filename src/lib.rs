@@ -7,7 +7,7 @@ extern crate alloc;
 extern crate std;
 
 mod codegen;
-mod frontend;
+pub mod frontend;
 mod middleend;
 mod runtime;
 mod tools;

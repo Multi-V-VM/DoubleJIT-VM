@@ -1848,7 +1848,7 @@ macro_rules! rvv {
     ($ident1:ident,$ident2:ident, $($t:expr),*) => { Instr::RV32(RV32Instr::$ident1($ident1::$ident2($( $t, )*))) };
 }
 impl Instruction {
-    fn parse(bit: &[u8]) -> Instruction {
+    pub fn parse(bit: &[u8]) -> Instruction {
         if let Some(instr) = try_from_compressed(bit) {
             instr
         } else {

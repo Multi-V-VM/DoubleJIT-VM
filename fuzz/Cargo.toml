@@ -9,9 +9,9 @@ edition = "2021"
 cargo-fuzz = true
 
 [dependencies]
-libfuzzer-sys = "0.4.6"
+libfuzzer-sys = "0.4"
 bytes = "1.4.0"
-doublejit-vm = { path = ".." }
+doublejit_vm = { path = ".." }
 
 # Prevent this from interfering with workspaces
 [workspace]

@@ -1,0 +1,110 @@
+# RISC-V Opcode Dictionary for Fuzzing
+# Format: "hex_bytes" for libFuzzer
+# This dictionary helps the fuzzer discover valid instruction opcodes faster
+
+# Base Integer Opcodes
+opcode_lui="\x37"
+opcode_auipc="\x17"
+opcode_jal="\x6F"
+opcode_jalr="\x67"
+opcode_branch="\x63"
+opcode_load="\x03"
+opcode_store="\x23"
+opcode_op_imm="\x13"
+opcode_op="\x33"
+opcode_misc_mem="\x0F"
+opcode_system="\x73"
+
+# RV64 Opcodes
+opcode_op_imm_32="\x1B"
+opcode_op_32="\x3B"
+
+# Atomic Extension
+opcode_amo="\x2F"
+
+# Floating-Point Opcodes
+opcode_load_fp="\x07"
+opcode_store_fp="\x27"
+opcode_fmadd="\x43"
+opcode_fmsub="\x47"
+opcode_fnmsub="\x4B"
+opcode_fnmadd="\x4F"
+opcode_op_fp="\x53"
+
+# Vector Extension Opcodes (RVV)
+opcode_vector_load="\x07"
+opcode_vector_store="\x27"
+opcode_vector="\x57"
+
+# Complete vector load instruction (VLE8.V v1, (x2))
+vector_vle8="\x07\x80\x01\x02"
+
+# Complete vector store instruction (VSE8.V v1, (x2))
+vector_vse8="\x27\x80\x01\x02"
+
+# VSETVLI instruction pattern (vsetvli a0, a1, e8,m1)
+vector_vsetvli="\x57\x75\x85\x00"
+
+# VSETIVLI instruction pattern (vsetivli a0, 4, e8,m1)
+vector_vsetivli="\x57\x75\x42\xC0"
+
+# VSETVL instruction pattern (vsetvl a0, a1, a2)
+vector_vsetvl="\x57\x75\xC5\x80"
+
+# Vector arithmetic patterns (VADD.VV)
+vector_vadd_vv="\x57\x00\x10\x02"
+
+# Vector arithmetic patterns (VADD.VX)
+vector_vadd_vx="\x57\x40\x10\x02"
+
+# Vector arithmetic patterns (VADD.VI)
+vector_vadd_vi="\x57\x30\x10\x02"
+
+# Compressed Instruction Prefixes (RVC)
+# Quadrant 0
+c_quad0_00="\x00\x00"
+c_quad0_01="\x00\x01"
+
+# Quadrant 1
+c_quad1_01="\x00\x01"
+c_quad1_11="\x00\x05"
+
+# Quadrant 2
+c_quad2_10="\x00\x02"
+
+# Common funct3 values (shifted to bit position 12)
+funct3_0="\x00\x00"
+funct3_1="\x00\x10"
+funct3_2="\x00\x20"
+funct3_3="\x00\x30"
+funct3_4="\x00\x40"
+funct3_5="\x00\x50"
+funct3_6="\x00\x60"
+funct3_7="\x00\x70"
+
+# Common funct6 values for vector instructions (bits [31:26])
+vfunct6_0="\x00\x00\x00\x00"
+vfunct6_1="\x00\x00\x00\x04"
+vfunct6_2="\x00\x00\x00\x08"
+vfunct6_8="\x00\x00\x00\x20"
+vfunct6_16="\x00\x00\x00\x40"
+vfunct6_32="\x00\x00\x00\x80"
+
+# Vector mask bit patterns (bit 25)
+vmask_on="\x00\x00\x00\x02"
+vmask_off="\x00\x00\x00\x00"
+
+# Register patterns (common register encodings)
+reg_x0="\x00"
+reg_x1="\x08"
+reg_x2="\x10"
+reg_sp="\x10"
+reg_ra="\x08"
+reg_v0="\x00"
+reg_v31="\xF8"
+
+# Complete instruction templates
+nop="\x13\x00\x00\x00"
+ret="\x67\x80\x00\x00"
+ebreak="\x73\x00\x10\x00"
+ecall="\x73\x00\x00\x00"
