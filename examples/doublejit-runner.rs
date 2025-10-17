@@ -1,4 +1,3 @@
-use doublejit_vm::frontend::binary::Binary;
 use doublejit_vm::frontend::elf::ElfFile;
 use doublejit_vm::frontend::instruction::Instruction;
 use doublejit_vm::middleend::{AddressMap, WasmEmitter, RiscVState};
@@ -25,7 +24,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("[1/5] 📥 Loading RISC-V binary: {}", path);
 
     let binary_data = std::fs::read(path)?;
-    let elf_file = ElfFile::new(&binary_data)?;
+    let elf_file = ElfFile::new(&binary_data).map_err(|e| format!("ELF parse error: {:?}", e))?;
 
     println!("      ✓ ELF class: {:?}", elf_file.header_part1.get_class());
     println!("      ✓ Machine: {:?}", elf_file.header_part2.get_machine());
@@ -83,14 +82,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 total_instructions += 1;
 
                 // Parse and emit instruction
-                if let Some(instr) = Instruction::parse(instr_bytes) {
-                    match emitter.emit_instruction(pc, &instr) {
-                        Ok(_) => {
-                            translated_instructions += 1;
-                        }
-                        Err(e) => {
-                            eprintln!("         ⚠ Warning at 0x{:x}: {}", pc, e);
-                        }
+                let instr = Instruction::parse(instr_bytes);
+                match emitter.emit_instruction(pc, &instr) {
+                    Ok(_) => {
+                        translated_instructions += 1;
+                    }
+                    Err(e) => {
+                        eprintln!("         ⚠ Warning at 0x{:x}: {}", pc, e);
                     }
                 }
 
@@ -107,11 +105,98 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     emitter.end_function();
-    let wat_code = emitter.finalize();
+    let function_code = emitter.finalize();
 
     println!("      ✓ Total instructions scanned: {}", total_instructions);
     println!("      ✓ Successfully translated: {}", translated_instructions);
-    println!("      ✓ WAT code size: {} bytes", wat_code.len());
+    println!("      ✓ WAT code size: {} bytes", function_code.len());
+
+    // Build complete WASM module with imports, memory, and globals
+    // IMPORTANT: In WASM, imports must come BEFORE globals
+    let vaddr_base = address_map.vaddr_base();
+    println!("      ✓ Virtual address base: 0x{:x}", vaddr_base);
+    println!("      ✓ Memory mapping: vaddr 0x{:x} → offset 0x{:x}", vaddr_base, address_map.memory_base);
+
+    // Print all mapped segments for debugging
+    println!("      📍 Mapped address ranges:");
+    for seg in address_map.segments() {
+        let end_addr = seg.vaddr + seg.size as u64 - 1;
+        println!("         0x{:x}-0x{:x} ({})", seg.vaddr, end_addr,
+                 if seg.executable { "exec" } else if seg.writable { "rw" } else { "ro" });
+    }
+
+    let complete_wat = format!(r#"(module
+  ;; Import syscall handler (must come before globals)
+  (import "env" "syscall" (func $syscall (param i64 i64 i64 i64 i64 i64 i64) (result i64)))
+  (import "env" "debug_print" (func $debug_print (param i32)))
+
+  ;; Memory: 256 pages initially (16MB), max 4096 pages (256MB)
+  (memory (export "memory") 256 4096)
+
+  ;; Globals for RISC-V register file (x0-x31)
+  (global $x0 (mut i64) (i64.const 0))
+  (global $x1 (mut i64) (i64.const 0))
+  (global $x2 (mut i64) (i64.const 0))
+  (global $x3 (mut i64) (i64.const 0))
+  (global $x4 (mut i64) (i64.const 0))
+  (global $x5 (mut i64) (i64.const 0))
+  (global $x6 (mut i64) (i64.const 0))
+  (global $x7 (mut i64) (i64.const 0))
+  (global $x8 (mut i64) (i64.const 0))
+  (global $x9 (mut i64) (i64.const 0))
+  (global $x10 (mut i64) (i64.const 0))
+  (global $x11 (mut i64) (i64.const 0))
+  (global $x12 (mut i64) (i64.const 0))
+  (global $x13 (mut i64) (i64.const 0))
+  (global $x14 (mut i64) (i64.const 0))
+  (global $x15 (mut i64) (i64.const 0))
+  (global $x16 (mut i64) (i64.const 0))
+  (global $x17 (mut i64) (i64.const 0))
+  (global $x18 (mut i64) (i64.const 0))
+  (global $x19 (mut i64) (i64.const 0))
+  (global $x20 (mut i64) (i64.const 0))
+  (global $x21 (mut i64) (i64.const 0))
+  (global $x22 (mut i64) (i64.const 0))
+  (global $x23 (mut i64) (i64.const 0))
+  (global $x24 (mut i64) (i64.const 0))
+  (global $x25 (mut i64) (i64.const 0))
+  (global $x26 (mut i64) (i64.const 0))
+  (global $x27 (mut i64) (i64.const 0))
+  (global $x28 (mut i64) (i64.const 0))
+  (global $x29 (mut i64) (i64.const 0))
+  (global $x30 (mut i64) (i64.const 0))
+  (global $x31 (mut i64) (i64.const 0))
+
+  ;; Program counter
+  (global $pc (mut i64) (i64.const 0))
+
+  ;; Memory mapping base - RISC-V virtual addresses need this offset subtracted
+  (global $vaddr_offset (mut i64) (i64.const {}))
+
+  ;; Vector CSRs
+  (global $vl (mut i64) (i64.const 0))
+  (global $vtype (mut i64) (i64.const 0))
+  (global $vstart (mut i64) (i64.const 0))
+  (global $vlenb (mut i64) (i64.const 256))
+
+  ;; Helper function: Translate RISC-V virtual address to WASM linear memory offset
+  (func $vaddr_to_offset (param $vaddr i64) (result i32)
+    local.get $vaddr
+    global.get $vaddr_offset
+    i64.sub
+    i64.const {}
+    i64.add
+    i32.wrap_i64
+  )
+
+{}
+
+  ;; Main entry point - wraps translated_code
+  (func $main (export "main") (result i32)
+    call $translated_code
+    i32.const 0
+  )
+)"#, vaddr_base, address_map.memory_base, function_code);
 
     // ========================================================================
     // STEP 4: Backend - Compile WAT to Native Code using Cranelift
@@ -121,16 +206,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let runtime_builder = RuntimeBuilder::new()?;
     let state = Arc::new(Mutex::new(RiscVState::default()));
 
-    // Set up initial PC
+    // Set up initial PC and stack pointer
     {
         let mut s = state.lock().unwrap();
         s.pc = entry_point;
         s.memory_base = address_map.memory_base;
+
+        // Initialize stack pointer (x2/sp) to top of available memory
+        // RISC-V stacks grow downward, so we set sp to a high address
+        // We'll use the end of our allocated memory region
+        let stack_top = (address_map.required_memory_size() - 16) as i64;
+        s.x_regs[2] = stack_top; // sp = x2
+        println!("      ✓ Stack pointer initialized to: 0x{:x}", stack_top);
     }
 
     // Compile WAT to native code
     println!("      🔨 Compiling WASM bytecode to native x86-64/ARM...");
-    let mut runtime = match runtime_builder.build_from_wat(&wat_code, state.clone()) {
+    let mut runtime = match runtime_builder.build_from_wat(&complete_wat, state.clone()) {
         Ok(rt) => {
             println!("      ✓ Native code compilation successful!");
             println!("      ✓ Target: {} architecture", std::env::consts::ARCH);
@@ -139,7 +231,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Err(e) => {
             eprintln!("\n❌ Compilation failed: {}", e);
             eprintln!("\nGenerated WAT code:");
-            eprintln!("{}", wat_code);
+            eprintln!("{}", complete_wat);
             return Err(e);
         }
     };

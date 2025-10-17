@@ -2359,7 +2359,7 @@ impl Instruction {
             }
             .unwrap();
 
-            dbg!(opcode);
+            // dbg!(opcode);
             Self { instr }
         }
     }

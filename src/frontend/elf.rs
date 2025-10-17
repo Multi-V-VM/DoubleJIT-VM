@@ -84,7 +84,7 @@ impl<'a> ElfFile<'a> {
         /* From index 0 (SHN_UNDEF) is an error */
         let start = (index as u64 * self.header_part2.get_sh_entry_size() as u64
             + self.header_part2.get_sh_offset() as u64) as usize;
-        dbg!(start);
+        // dbg!(start);
         let end = start + self.header_part2.get_sh_entry_size() as usize;
         Ok(match self.header_part1.get_class() {
             Class::ThirtyTwo => {

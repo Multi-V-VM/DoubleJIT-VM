@@ -26,6 +26,8 @@ pub struct AddressMap {
     /// Base address where program memory starts in WASM linear memory
     /// (We reserve 0x0-0xFFFF for special purposes)
     pub memory_base: u32,
+    /// Minimum virtual address across ALL allocated sections (even ones we don't load)
+    min_vaddr: u64,
 }
 
 impl AddressMap {
@@ -35,6 +37,7 @@ impl AddressMap {
             segments: Vec::new(),
             vaddr_to_offset: HashMap::new(),
             memory_base,
+            min_vaddr: 0,
         }
     }
 
@@ -42,10 +45,42 @@ impl AddressMap {
     ///
     /// This extracts .data, .rodata, .bss and other loadable sections
     pub fn from_sections<'a>(elf_file: &crate::frontend::elf::ElfFile<'a>, sections: impl Iterator<Item = SectionHeader<'a>>) -> Self {
-        let mut map = Self::new(0x10000); // Start program memory at 64KB
-        let mut current_offset = map.memory_base;
+        // Start program memory at 0 to allow NULL pointer region to be accessible
+        // (though it will be zero-filled and reads will return 0)
+        let mut map = Self::new(0);
 
-        for section in sections {
+        // Collect sections into a Vec to enable two-pass processing
+        let sections_vec: Vec<_> = sections.collect();
+
+        // First pass: find minimum virtual address
+        let sections_min_vaddr = sections_vec
+            .iter()
+            .filter_map(|section| {
+                let (section_addr, section_size, section_flags) = match section {
+                    SectionHeader::SectionHeader32(h) => (h.address as u64, h.size as usize, h.flags as u64),
+                    SectionHeader::SectionHeader64(h) => (h.address, h.size as usize, h.flags),
+                };
+                // Only consider allocated sections with non-zero size
+                if section_size > 0 && (section_flags & 0x2) != 0 {
+                    Some(section_addr)
+                } else {
+                    None
+                }
+            })
+            .min()
+            .unwrap_or(0);
+
+        // Map from virtual address 0 to handle NULL pointers and low addresses
+        // This prevents underflow in address translation
+        let min_vaddr = 0;
+
+        println!("Sections start at: 0x{:x}, mapping from: 0x{:x}", sections_min_vaddr, min_vaddr);
+
+        // Store min_vaddr in the map
+        map.min_vaddr = min_vaddr;
+
+        // Second pass: process sections and create linear mapping
+        for section in sections_vec {
             // Get section properties using the internal methods via pattern matching
             let (section_addr, section_size, section_flags) = match section {
                 SectionHeader::SectionHeader32(h) => (h.address as u64, h.size as usize, h.flags as u64),
@@ -78,8 +113,13 @@ impl AddressMap {
                 continue;
             }
 
-            println!("Loading section '{}' at vaddr=0x{:x}, size=0x{:x}, offset=0x{:x}",
-                     section_name, section_addr, section_size, current_offset);
+            // Calculate linear offset: (vaddr - min_vaddr) + memory_base
+            // This maintains a 1:1 mapping from virtual address space to linear memory
+            let linear_offset = (section_addr - min_vaddr) as u32 + map.memory_base;
+
+            println!("Loading section '{}' at vaddr=0x{:x}, size=0x{:x}, offset=0x{:x} (vaddr range: 0x{:x}-0x{:x})",
+                     section_name, section_addr, section_size, linear_offset,
+                     section_addr, section_addr + section_size as u64 - 1);
 
             // Extract section data
             let section_data = if is_bss {
@@ -87,15 +127,13 @@ impl AddressMap {
                 None
             } else {
                 // Get actual data from section
-                match section.get_data(elf_file) {
-                    Ok(SectionData::Undefined(data)) => {
-                        Some(data.to_vec())
-                    }
-                    Ok(SectionData::Empty) => None,
-                    _ => {
-                        // For other section types, try to get raw data
-                        Some(section.raw_data(elf_file).to_vec())
-                    }
+                let raw = section.raw_data(elf_file);
+                if raw.is_empty() {
+                    println!("  Warning: Section '{}' has no data!", section_name);
+                    None
+                } else {
+                    println!("  Extracted {} bytes from section '{}'", raw.len(), section_name);
+                    Some(raw.to_vec())
                 }
             };
 
@@ -109,12 +147,9 @@ impl AddressMap {
             };
 
             // Map virtual address to linear memory offset
-            map.vaddr_to_offset.insert(section_addr, current_offset);
+            map.vaddr_to_offset.insert(section_addr, linear_offset);
 
             map.segments.push(segment);
-
-            // Align to 4KB page boundary for next section
-            current_offset += ((section_size + 0xFFF) & !0xFFF) as u32;
         }
 
         map
@@ -143,7 +178,19 @@ impl AddressMap {
         for segment in &self.segments {
             if let Some(data) = &segment.data {
                 if let Some(&offset) = self.vaddr_to_offset.get(&segment.vaddr) {
-                    initializers.push((offset, data.clone()));
+                    // Pad data to match segment size if needed
+                    // (Some sections have larger in-memory size than file size)
+                    let mut padded_data = data.clone();
+                    if padded_data.len() < segment.size {
+                        padded_data.resize(segment.size, 0);
+                    }
+                    initializers.push((offset, padded_data));
+                }
+            } else {
+                // BSS sections - zero-initialized
+                if let Some(&offset) = self.vaddr_to_offset.get(&segment.vaddr) {
+                    let zero_data = vec![0u8; segment.size];
+                    initializers.push((offset, zero_data));
                 }
             }
         }
@@ -176,6 +223,13 @@ impl AddressMap {
     /// Get all memory segments
     pub fn segments(&self) -> &[MemorySegment] {
         &self.segments
+    }
+
+    /// Get the minimum virtual address across all allocated sections
+    /// This is the offset that needs to be subtracted from RISC-V addresses
+    /// to get WASM linear memory offsets
+    pub fn vaddr_base(&self) -> u64 {
+        self.min_vaddr
     }
 }
 
