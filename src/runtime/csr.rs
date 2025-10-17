@@ -214,7 +214,8 @@ impl CsrManager {
         let vlmul = vtype_immediate & 0b111; // LMUL[2:0]
 
         // Calculate VLMAX based on SEW and LMUL
-        let sew_bytes = 1 << (vsew + 3); // 8, 16, 32, 64, 128, 256, 512, 1024 bits
+        // vsew encoding: 0=8bit, 1=16bit, 2=32bit, 3=64bit, etc.
+        let sew_bits = 8 << vsew; // SEW in bits: 8, 16, 32, 64, 128, 256, 512, 1024
         let vlen = state.csr.vlenb * 8; // VLEN in bits
 
         // LMUL calculation
@@ -229,7 +230,7 @@ impl CsrManager {
             _ => 1.0,       // Reserved
         };
 
-        let vlmax = ((vlen as f64) * lmul_float / (sew_bytes as f64 * 8.0)) as u64;
+        let vlmax = ((vlen as f64) * lmul_float / (sew_bits as f64)) as u64;
 
         // Calculate VL
         let new_vl = if avl <= vlmax {

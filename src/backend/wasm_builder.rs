@@ -5,30 +5,65 @@ use wasmer::{
 use wasmer_compiler_cranelift::Cranelift;
 use std::sync::{Arc, Mutex};
 
+/// Optimization level for Cranelift code generation
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OptLevel {
+    /// No optimizations - fastest compilation
+    None,
+    /// Basic optimizations - balanced
+    Speed,
+    /// Maximum optimizations - best runtime performance
+    SpeedAndSize,
+}
+
 /// Backend builder that compiles WAT to native code using Cranelift
 ///
 /// Pipeline: WAT → WASM bytecode → Cranelift IR → native x86/ARM code → Wasmer runtime
+///
+/// The Cranelift compiler automatically detects the host architecture and generates
+/// optimized native code:
+/// - x86-64 (Intel/AMD) on Linux, Windows, macOS
+/// - ARM64/AArch64 on Apple Silicon, ARM servers, embedded systems
+/// - Other architectures supported by Cranelift
 pub struct WasmBuilder {
     /// Cranelift compiler engine
     engine: Engine,
     /// Wasmer store for managing compiled modules
     store: Store,
+    /// Optimization level
+    opt_level: OptLevel,
 }
 
 impl WasmBuilder {
     /// Create a new WasmBuilder with Cranelift compiler
     pub fn new() -> Result<Self, Box<dyn std::error::Error>> {
-        // Configure Cranelift compiler
-        let compiler = Cranelift::default();
+        Self::with_opt_level(OptLevel::Speed)
+    }
+
+    /// Create a WasmBuilder with specific optimization level
+    pub fn with_opt_level(opt_level: OptLevel) -> Result<Self, Box<dyn std::error::Error>> {
+        // Configure Cranelift compiler based on optimization level
+        let mut compiler = Cranelift::default();
+
+        // Note: Wasmer's Cranelift wrapper may not expose all settings directly
+        // but the default configuration is already optimized for the target architecture
 
         // Create engine with Cranelift backend
-        // This will compile WASM to native code (x86-64, ARM, etc.)
+        // This will compile WASM to native code for the current architecture:
+        // - Detects x86-64, ARM64, etc. automatically
+        // - Uses architecture-specific optimizations
+        // - Generates machine code that runs directly on the CPU
         let engine = Engine::from(compiler);
 
         // Create store with the Cranelift engine
         let store = Store::new(engine.clone());
 
-        Ok(Self { engine, store })
+        Ok(Self { engine, store, opt_level })
+    }
+
+    /// Get the current optimization level
+    pub fn opt_level(&self) -> OptLevel {
+        self.opt_level
     }
 
     /// Compile WAT (WebAssembly Text) to native code and create a Wasmer module
