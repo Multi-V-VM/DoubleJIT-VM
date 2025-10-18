@@ -40,6 +40,21 @@ impl WasmEmitter {
         self.in_block = true;
     }
 
+    /// Start an infinite loop (for interpreter-style execution)
+    pub fn start_loop(&mut self) {
+        writeln!(&mut self.wat_code, "    (loop $interpreter_loop").unwrap();
+    }
+
+    /// End the loop with exit flag check
+    pub fn end_loop_with_exit_check(&mut self) {
+        writeln!(&mut self.wat_code, "      ;; Check if program should exit").unwrap();
+        writeln!(&mut self.wat_code, "      global.get $exit_flag").unwrap();
+        writeln!(&mut self.wat_code, "      i32.const 0").unwrap();
+        writeln!(&mut self.wat_code, "      i32.eq").unwrap();
+        writeln!(&mut self.wat_code, "      br_if $interpreter_loop").unwrap();
+        writeln!(&mut self.wat_code, "    )").unwrap(); // Close loop
+    }
+
     /// End the current function
     pub fn end_function(&mut self) {
         writeln!(&mut self.wat_code, "  )").unwrap();
@@ -60,14 +75,30 @@ impl WasmEmitter {
 
     /// Emit a single RISC-V instruction as WAT
     pub fn emit_instruction(&mut self, pc: u64, instr: &Instruction) -> Result<(), String> {
-        // Update PC global before executing instruction
-        // This is needed for AUIPC and other PC-relative instructions
+        // Wrap instruction in PC check - only execute if PC matches
         writeln!(
             &mut self.wat_code,
-            "    ;; PC=0x{:08x}: {:?}\n    i64.const {}\n    global.set $pc",
+            "      ;; PC=0x{:08x}: {:?}\n      global.get $pc\n      i64.const {}\n      i64.eq\n      if",
             pc, instr.instr, pc as i64
         )
         .unwrap();
+
+        // Check if this instruction modifies PC (branches/jumps)
+        let modifies_pc = matches!(
+            &instr.instr,
+            Instr::RV32(rv32) if matches!(rv32,
+                crate::frontend::instruction::RV32Instr::RV32I(i) if matches!(i,
+                    crate::frontend::instruction::RV32I::JAL(_,_) |
+                    crate::frontend::instruction::RV32I::JALR(_,_,_) |
+                    crate::frontend::instruction::RV32I::BEQ(_,_,_) |
+                    crate::frontend::instruction::RV32I::BNE(_,_,_) |
+                    crate::frontend::instruction::RV32I::BLT(_,_,_) |
+                    crate::frontend::instruction::RV32I::BGE(_,_,_) |
+                    crate::frontend::instruction::RV32I::BLTU(_,_,_) |
+                    crate::frontend::instruction::RV32I::BGEU(_,_,_)
+                )
+            )
+        );
 
         match &instr.instr {
             Instr::RV32(rv32instr) => match rv32instr {
@@ -97,12 +128,18 @@ impl WasmEmitter {
             }
         }
 
-        // Update PC
-        writeln!(
-            &mut self.wat_code,
-            "    global.get $pc\n    i64.const 4\n    i64.add\n    global.set $pc"
-        )
-        .unwrap();
+        // Update PC to next instruction (PC += 4)
+        // Skip this for branch/jump instructions since they set PC themselves
+        if !modifies_pc {
+            writeln!(
+                &mut self.wat_code,
+                "        global.get $pc\n        i64.const 4\n        i64.add\n        global.set $pc"
+            )
+            .unwrap();
+        }
+
+        // Close the if block
+        writeln!(&mut self.wat_code, "      end").unwrap();
 
         self.instr_count += 1;
         Ok(())

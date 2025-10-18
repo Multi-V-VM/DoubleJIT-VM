@@ -50,6 +50,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut emitter = WasmEmitter::new();
     emitter.start_function("translated_code");
+    emitter.start_loop(); // Start interpreter loop
 
     let entry_point = elf_file.header_part2.get_entry_point();
     let mut pc = entry_point;
@@ -98,6 +99,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    emitter.end_loop_with_exit_check(); // End interpreter loop with exit check
     emitter.end_function();
     let function_code = emitter.finalize();
 
@@ -174,6 +176,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
   (global $vstart (mut i64) (i64.const 0))
   (global $vlenb (mut i64) (i64.const 256))
 
+  ;; Exit flag - set to 1 when program should exit (exported so syscall handler can set it)
+  (global $exit_flag (export "exit_flag") (mut i32) (i32.const 0))
+
   ;; Helper function: Translate RISC-V virtual address to WASM linear memory offset
   (func $vaddr_to_offset (param $vaddr i64) (result i32)
     ;; Just do the translation - trust that the address is valid
@@ -190,10 +195,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
   ;; Main entry point - wraps translated_code
   (func $main (export "main") (result i32)
+    ;; Initialize PC to entry point before starting interpreter
+    i64.const {}
+    global.set $pc
     call $translated_code
     i32.const 0
   )
-)"#, vaddr_base, address_map.memory_base, function_code);
+)"#, vaddr_base, address_map.memory_base, function_code, entry_point);
 
     // ========================================================================
     // STEP 4: Backend - Compile WAT to Native Code using Cranelift

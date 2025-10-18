@@ -118,6 +118,8 @@ pub struct SyscallEnv {
     state: Arc<Mutex<crate::middleend::RiscVState>>,
     /// Reference to WASM memory for reading/writing buffers
     memory: Option<wasmer::Memory>,
+    /// Exit flag global (for breaking interpreter loop)
+    exit_flag: Option<wasmer::Global>,
 }
 
 /// Runtime environment for executing compiled RISC-V code
@@ -132,6 +134,8 @@ pub struct RiscVRuntime {
     store: Store,
     /// RISC-V architectural state
     state: Arc<Mutex<crate::middleend::RiscVState>>,
+    /// Exit flag global (for breaking interpreter loop)
+    exit_flag: Option<wasmer::Global>,
 }
 
 impl RiscVRuntime {
@@ -145,6 +149,7 @@ impl RiscVRuntime {
         let syscall_env = Arc::new(Mutex::new(SyscallEnv {
             state: state.clone(),
             memory: None, // Will be set after instance creation
+            exit_flag: None, // Will be set after instance creation
         }));
 
         // Create function environment for host functions
@@ -174,11 +179,18 @@ impl RiscVRuntime {
             syscall_env.lock().unwrap().memory = Some(memory.clone());
         }
 
+        // Get exit_flag global if exported and store in environment
+        let exit_flag = instance.exports.get_global("exit_flag").ok().cloned();
+        if let Some(ref flag) = exit_flag {
+            syscall_env.lock().unwrap().exit_flag = Some(flag.clone());
+        }
+
         Ok(Self {
             module,
             instance,
             store,
             state,
+            exit_flag,
         })
     }
 
@@ -236,7 +248,7 @@ impl RiscVRuntime {
 
     /// RISC-V syscall handler (called from native code)
     fn syscall_handler(
-        env: FunctionEnvMut<Arc<Mutex<SyscallEnv>>>,
+        mut env: FunctionEnvMut<Arc<Mutex<SyscallEnv>>>,
         syscall_num: i64,
         arg1: i64,
         arg2: i64,
@@ -245,20 +257,30 @@ impl RiscVRuntime {
         arg5: i64,
         arg6: i64,
     ) -> i64 {
-        let syscall_env = env.data().lock().unwrap();
-        let _state = syscall_env.state.lock().unwrap();
-
         // Implement RISC-V Linux syscalls
         match syscall_num {
             93 => {
-                // exit(status)
-                std::process::exit(arg1 as i32);
+                // exit(status) - set exit flag to break interpreter loop
+                eprintln!("DEBUG: exit syscall called with status={}", arg1);
+                // Get exit flag (need to do this before locking other things)
+                let exit_flag = {
+                    let syscall_env = env.data().lock().unwrap();
+                    syscall_env.exit_flag.clone()
+                };
+                if let Some(exit_flag) = exit_flag {
+                    exit_flag.set(&mut env, wasmer::Value::I32(1)).ok();
+                }
+                arg1 // Return exit status
             }
             64 => {
                 // write(fd, buf, count)
                 let fd = arg1 as i32;
                 let buf_addr = arg2 as u64;
                 let count = arg3 as usize;
+
+                eprintln!("DEBUG: write(fd={}, buf=0x{:x}, count={})", fd, buf_addr, count);
+
+                let syscall_env = env.data().lock().unwrap();
 
                 // Get memory view to read the buffer
                 if let Some(ref memory) = syscall_env.memory {
