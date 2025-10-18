@@ -1784,7 +1784,8 @@ macro_rules! rrm {
             0b011 => RoundingMode::RUP,
             0b100 => RoundingMode::RMM,
             0b111 => RoundingMode::DYN,
-            _ => panic!("wrong RoundingMode"),
+            // Invalid rounding mode - use RNE (Round to Nearest, ties to Even) as default
+            _ => RoundingMode::RNE,
         };
         $type!($opcode1, $opcode2, rd, rs1, rs2, rm)
     }};
@@ -1801,7 +1802,8 @@ macro_rules! rrm_no_rs2 {
             0b011 => RoundingMode::RUP,
             0b100 => RoundingMode::RMM,
             0b111 => RoundingMode::DYN,
-            _ => panic!("wrong RoundingMode"),
+            // Invalid rounding mode - use RNE (Round to Nearest, ties to Even) as default
+            _ => RoundingMode::RNE,
         };
         $type!($opcode1, $opcode2, rd, rs1, rm)
     }};
@@ -1820,7 +1822,8 @@ macro_rules! r4 {
             0b011 => RoundingMode::RUP,
             0b100 => RoundingMode::RMM,
             0b111 => RoundingMode::DYN,
-            _ => panic!("wrong RoundingMode"),
+            // Invalid rounding mode - use RNE (Round to Nearest, ties to Even) as default
+            _ => RoundingMode::RNE,
         };
         $type!($opcode1, $opcode2, rd, rs1, rs2, rs3, rm)
     }};
@@ -2357,7 +2360,11 @@ impl Instruction {
                 },
                 _ => None,
             }
-            .unwrap();
+            .unwrap_or_else(|| {
+                // Unknown instruction - return NOP instead of panicking
+                // This allows the parser to continue processing even with unrecognized instructions
+                Instr::NOP
+            });
 
             // dbg!(opcode);
             Self { instr }

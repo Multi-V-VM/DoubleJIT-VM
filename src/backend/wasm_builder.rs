@@ -112,6 +112,14 @@ impl Default for WasmBuilder {
     }
 }
 
+/// Environment for syscall handlers - includes both state and memory reference
+pub struct SyscallEnv {
+    /// RISC-V architectural state
+    state: Arc<Mutex<crate::middleend::RiscVState>>,
+    /// Reference to WASM memory for reading/writing buffers
+    memory: Option<wasmer::Memory>,
+}
+
 /// Runtime environment for executing compiled RISC-V code
 ///
 /// This wraps the Cranelift-compiled native code with RISC-V runtime state
@@ -133,8 +141,14 @@ impl RiscVRuntime {
         module: Module,
         state: Arc<Mutex<crate::middleend::RiscVState>>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
+        // Create syscall environment with state
+        let syscall_env = Arc::new(Mutex::new(SyscallEnv {
+            state: state.clone(),
+            memory: None, // Will be set after instance creation
+        }));
+
         // Create function environment for host functions
-        let env = FunctionEnv::new(&mut store, state.clone());
+        let env = FunctionEnv::new(&mut store, syscall_env.clone());
 
         // Set up imports for RISC-V syscalls and runtime functions
         let import_object = imports! {
@@ -154,6 +168,11 @@ impl RiscVRuntime {
 
         // Instantiate the module (this runs the Cranelift-compiled native code)
         let instance = Instance::new(&mut store, &module, &import_object)?;
+
+        // Get memory and store it in the environment
+        if let Ok(memory) = instance.exports.get_memory("memory") {
+            syscall_env.lock().unwrap().memory = Some(memory.clone());
+        }
 
         Ok(Self {
             module,
@@ -217,7 +236,7 @@ impl RiscVRuntime {
 
     /// RISC-V syscall handler (called from native code)
     fn syscall_handler(
-        mut env: FunctionEnvMut<Arc<Mutex<crate::middleend::RiscVState>>>,
+        env: FunctionEnvMut<Arc<Mutex<SyscallEnv>>>,
         syscall_num: i64,
         arg1: i64,
         arg2: i64,
@@ -226,42 +245,159 @@ impl RiscVRuntime {
         arg5: i64,
         arg6: i64,
     ) -> i64 {
-        let _state = env.data().lock().unwrap();
+        let syscall_env = env.data().lock().unwrap();
+        let _state = syscall_env.state.lock().unwrap();
 
         // Implement RISC-V Linux syscalls
         match syscall_num {
             93 => {
-                // exit
-                println!("RISC-V exit({})", arg1);
+                // exit(status)
                 std::process::exit(arg1 as i32);
             }
             64 => {
                 // write(fd, buf, count)
-                println!("RISC-V write(fd={}, buf=0x{:x}, count={})", arg1, arg2, arg3);
-                // TODO: Implement actual write to stdout/stderr
-                arg3 as i64 // return bytes written
+                let fd = arg1 as i32;
+                let buf_addr = arg2 as u64;
+                let count = arg3 as usize;
+
+                // Get memory view to read the buffer
+                if let Some(ref memory) = syscall_env.memory {
+                    let view = memory.view(&env);
+                    let mut buffer = vec![0u8; count];
+
+                    // Read from WASM memory
+                    for (i, byte) in buffer.iter_mut().enumerate() {
+                        if let Ok(b) = view.read_u8(buf_addr + i as u64) {
+                            *byte = b;
+                        }
+                    }
+
+                    // Write to appropriate file descriptor
+                    use std::io::Write;
+                    let result = match fd {
+                        1 => std::io::stdout().write(&buffer),
+                        2 => std::io::stderr().write(&buffer),
+                        _ => {
+                            eprintln!("Warning: write to unsupported fd {}", fd);
+                            Ok(count)
+                        }
+                    };
+
+                    match result {
+                        Ok(n) => {
+                            let _ = std::io::stdout().flush();
+                            n as i64
+                        }
+                        Err(_) => -1, // EIO
+                    }
+                } else {
+                    // Fallback if memory not available
+                    eprintln!("Warning: write syscall without memory access");
+                    count as i64
+                }
             }
             63 => {
                 // read(fd, buf, count)
-                println!("RISC-V read(fd={}, buf=0x{:x}, count={})", arg1, arg2, arg3);
-                // TODO: Implement actual read
+                eprintln!("Warning: read syscall not fully implemented");
                 0 // return bytes read
             }
             214 => {
                 // brk - memory allocation
-                println!("RISC-V brk(0x{:x})", arg1);
+                // For now, just return the requested address
+                arg1
+            }
+            // Common syscalls that programs might use
+            57 => {
+                // close(fd)
+                0 // success
+            }
+            62 => {
+                // lseek(fd, offset, whence)
+                arg2 // return offset
+            }
+            80 => {
+                // fstat(fd, statbuf)
+                -1 // EBADF
+            }
+            96 => {
+                // set_tid_address
+                1 // return fake tid
+            }
+            134 => {
+                // rt_sigaction
+                0 // success (ignore signals)
+            }
+            135 => {
+                // rt_sigprocmask
+                0 // success (ignore signals)
+            }
+            160 => {
+                // uname
+                0 // success (fake it)
+            }
+            169 => {
+                // gettimeofday
+                0 // success (return 0 time)
+            }
+            174 => {
+                // getuid
+                1000 // fake uid
+            }
+            175 => {
+                // getgid
+                1000 // fake gid
+            }
+            176 => {
+                // geteuid
+                1000 // fake euid
+            }
+            177 => {
+                // getegid
+                1000 // fake egid
+            }
+            226 => {
+                // mprotect
+                0 // success (ignore)
+            }
+            98 => {
+                // futex(uaddr, futex_op, val, timeout, uaddr2, val3)
+                eprintln!("futex syscall (stubbed): op={}, addr=0x{:x}", arg2, arg1);
+                0 // success (ignore for now)
+            }
+            99 => {
+                // set_robust_list
+                0 // success (ignore)
+            }
+            222 => {
+                // mmap
+                eprintln!("mmap syscall (stubbed): addr=0x{:x}, len=0x{:x}, prot={}, flags={}",
+                         arg1, arg2, arg3, arg4);
                 arg1 // return requested address
             }
+            261 => {
+                // prlimit64
+                0 // success (ignore)
+            }
             _ => {
-                println!("Unknown syscall: {}", syscall_num);
-                -1 // ENOSYS
+                // Check if syscall number looks like garbage (way too high)
+                if syscall_num > 500 || syscall_num < 0 {
+                    eprintln!("ERROR: Invalid syscall number {} - this is likely a bug!", syscall_num);
+                    eprintln!("  This usually means x17 (a7) register contains garbage");
+                    eprintln!("  Args: {}, {}, {}, {}, {}, {}", arg1, arg2, arg3, arg4, arg5, arg6);
+                    // Return error to help debug
+                    -38 // ENOSYS
+                } else {
+                    eprintln!("Unknown syscall: {} (args: {}, {}, {}, {}, {}, {})",
+                             syscall_num, arg1, arg2, arg3, arg4, arg5, arg6);
+                    -38 // ENOSYS
+                }
             }
         }
     }
 
     /// Debug print handler (called from native code)
     fn debug_print_handler(
-        _env: FunctionEnvMut<Arc<Mutex<crate::middleend::RiscVState>>>,
+        _env: FunctionEnvMut<Arc<Mutex<SyscallEnv>>>,
         val: i32,
     ) {
         println!("DEBUG: 0x{:08x} ({})", val, val);

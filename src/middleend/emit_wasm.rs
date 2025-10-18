@@ -60,11 +60,12 @@ impl WasmEmitter {
 
     /// Emit a single RISC-V instruction as WAT
     pub fn emit_instruction(&mut self, pc: u64, instr: &Instruction) -> Result<(), String> {
-        // Add PC update comment
+        // Update PC global before executing instruction
+        // This is needed for AUIPC and other PC-relative instructions
         writeln!(
             &mut self.wat_code,
-            "    ;; PC=0x{:08x}: {:?}",
-            pc, instr.instr
+            "    ;; PC=0x{:08x}: {:?}\n    i64.const {}\n    global.set $pc",
+            pc, instr.instr, pc as i64
         )
         .unwrap();
 
@@ -569,9 +570,13 @@ impl WasmEmitter {
             }
 
             ECALL => {
+                // RISC-V syscall convention:
+                // a7 (x17) = syscall number
+                // a0-a5 (x10-x15) = arguments
+                // Result returned in a0 (x10)
                 writeln!(
                     &mut self.wat_code,
-                    "    ;; ECALL\n    global.get $x10\n    global.get $x11\n    global.get $x12\n    global.get $x13\n    global.get $x14\n    global.get $x15\n    global.get $x16\n    call $syscall\n    global.set $x10"
+                    "    ;; ECALL - RISC-V syscall\n    global.get $x17\n    global.get $x10\n    global.get $x11\n    global.get $x12\n    global.get $x13\n    global.get $x14\n    global.get $x15\n    call $syscall\n    global.set $x10"
                 )
                 .unwrap();
             }
