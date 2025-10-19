@@ -15,6 +15,7 @@ wasm-bindgen-test = "0.3.54"
 wasmer = "6.1.0"
 zero = "0.1.2"
 wasmer-compiler-cranelift = "6.1.0"
+wasmer-compiler-singlepass = "6.1.0"
 wasmer-wasix = "0.601.0"
 tokio = { version = "1.0", features = ["rt", "rt-multi-thread", "macros"] }
 [lib]

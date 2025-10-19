@@ -785,6 +785,7 @@ dependencies = [
  "wasm-bindgen-test",
  "wasmer",
  "wasmer-compiler-cranelift",
+ "wasmer-compiler-singlepass",
  "wasmer-wasix",
  "zero",
 ]
@@ -800,6 +801,33 @@ name = "dyn-clone"
 version = "1.0.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d0881ea181b1df73ff77ffaaf9c7544ecc11e82fba9b5f27b262a3c73a332555"
+
+[[package]]
+name = "dynasm"
+version = "4.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6a31e49f416ec431ceef002ee220eee9da97687ec3ecea8040703edbaa75e157"
+dependencies = [
+ "bitflags 2.9.4",
+ "byteorder",
+ "lazy_static",
+ "proc-macro-error2",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.106",
+]
+
+[[package]]
+name = "dynasmrt"
+version = "4.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "81897269eb88949825a9add5a33fb4456ba6a39811e0909172f21c841457d347"
+dependencies = [
+ "byteorder",
+ "dynasm",
+ "fnv",
+ "memmap2 0.9.8",
+]
 
 [[package]]
 name = "either"
@@ -1701,6 +1729,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "memmap2"
+version = "0.9.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "843a98750cd611cc2965a8213b53b43e715f13c37a9e096c6408e69990961db7"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "memoffset"
 version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2206,9 +2243,9 @@ dependencies = [
 
 [[package]]
 name = "quote"
-version = "1.0.35"
+version = "1.0.41"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "291ec9ab5efd934aaf503a6466c5d5251535d108ee747472c3977cc5acc868ef"
+checksum = "ce25767e7b499d1b604768e7cde645d14cc8584231ea6b295e9c9eb22c02e1d1"
 dependencies = [
  "proc-macro2",
 ]
@@ -2827,7 +2864,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f6c99835bad52957e7aa241d3975ed17c1e5f8c92026377d117a606f36b84b16"
 dependencies = [
  "bytes",
- "memmap2",
+ "memmap2 0.6.2",
 ]
 
 [[package]]
@@ -3832,7 +3869,7 @@ dependencies = [
  "leb128",
  "libc",
  "macho-unwind-info",
- "memmap2",
+ "memmap2 0.6.2",
  "more-asserts",
  "object 0.32.2",
  "region",
@@ -3865,6 +3902,24 @@ dependencies = [
  "smallvec",
  "target-lexicon",
  "tracing",
+ "wasmer-compiler",
+ "wasmer-types",
+]
+
+[[package]]
+name = "wasmer-compiler-singlepass"
+version = "6.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3ffadcc9bc282f287173024802fd190e0fa120854191e141252ad1d1469c80e3"
+dependencies = [
+ "byteorder",
+ "dynasm",
+ "dynasmrt",
+ "enumset",
+ "gimli 0.28.1",
+ "more-asserts",
+ "rayon",
+ "smallvec",
  "wasmer-compiler",
  "wasmer-types",
 ]

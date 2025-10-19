@@ -2,7 +2,8 @@ use wasmer::{
     imports, wat2wasm, Engine, Function, FunctionEnv, FunctionEnvMut, Instance, Module, Store,
     Value,
 };
-use wasmer_compiler_cranelift::Cranelift;
+use wasmer::sys::EngineBuilder;
+use wasmer_compiler_singlepass::Singlepass;
 use wasmer_wasix::{WasiEnvBuilder, WasiFunctionEnv};
 use std::sync::{Arc, Mutex};
 
@@ -17,17 +18,16 @@ pub enum OptLevel {
     SpeedAndSize,
 }
 
-/// Backend builder that compiles WAT to native code using Cranelift
+/// Backend builder that compiles WAT to native code using Singlepass
 ///
-/// Pipeline: WAT → WASM bytecode → Cranelift IR → native x86/ARM code → Wasmer runtime
+/// Pipeline: WAT → WASM bytecode → Singlepass → native x86/ARM code → Wasmer runtime
 ///
-/// The Cranelift compiler automatically detects the host architecture and generates
-/// optimized native code:
+/// The Singlepass compiler is a fast single-pass compiler that can handle very large functions
+/// without the code size limitations of Cranelift. It generates native code for:
 /// - x86-64 (Intel/AMD) on Linux, Windows, macOS
 /// - ARM64/AArch64 on Apple Silicon, ARM servers, embedded systems
-/// - Other architectures supported by Cranelift
 pub struct WasmBuilder {
-    /// Cranelift compiler engine
+    /// Singlepass compiler engine
     engine: Engine,
     /// Wasmer store for managing compiled modules
     store: Store,
@@ -36,27 +36,25 @@ pub struct WasmBuilder {
 }
 
 impl WasmBuilder {
-    /// Create a new WasmBuilder with Cranelift compiler
+    /// Create a new WasmBuilder with Singlepass compiler
     pub fn new() -> Result<Self, Box<dyn std::error::Error>> {
         Self::with_opt_level(OptLevel::Speed)
     }
 
     /// Create a WasmBuilder with specific optimization level
     pub fn with_opt_level(opt_level: OptLevel) -> Result<Self, Box<dyn std::error::Error>> {
-        // Configure Cranelift compiler based on optimization level
-        let compiler = Cranelift::default();
+        // Configure Singlepass compiler - it's a simple single-pass compiler
+        // that can handle very large functions without code size limits
+        let compiler = Singlepass::new();
 
-        // Note: Wasmer's Cranelift wrapper may not expose all settings directly
-        // but the default configuration is already optimized for the target architecture
-
-        // Create engine with Cranelift backend
+        // Create engine with Singlepass backend
         // This will compile WASM to native code for the current architecture:
         // - Detects x86-64, ARM64, etc. automatically
-        // - Uses architecture-specific optimizations
+        // - Fast compilation, handles large functions
         // - Generates machine code that runs directly on the CPU
-        let engine = Engine::from(compiler);
+        let engine: Engine = EngineBuilder::new(compiler).into();
 
-        // Create store with the Cranelift engine
+        // Create store with the Singlepass engine
         let store = Store::new(engine.clone());
 
         Ok(Self { engine, store, opt_level })
@@ -119,8 +117,8 @@ pub struct SyscallEnv {
     state: Arc<Mutex<crate::middleend::RiscVState>>,
     /// Reference to WASM memory for reading/writing buffers
     memory: Option<wasmer::Memory>,
-    /// Exit flag global (for breaking interpreter loop)
-    exit_flag: Option<wasmer::Global>,
+    /// Exit flag setter function (for breaking interpreter loop)
+    set_exit_flag_func: Option<wasmer::Function>,
     /// WASI environment for handling file I/O through WASI
     wasi_env: Option<Arc<Mutex<WasiFunctionEnv>>>,
 }
@@ -137,8 +135,8 @@ pub struct RiscVRuntime {
     store: Store,
     /// RISC-V architectural state
     state: Arc<Mutex<crate::middleend::RiscVState>>,
-    /// Exit flag global (for breaking interpreter loop)
-    exit_flag: Option<wasmer::Global>,
+    /// Exit flag setter function (for breaking interpreter loop)
+    set_exit_flag_func: Option<wasmer::Function>,
 }
 
 impl RiscVRuntime {
@@ -152,7 +150,7 @@ impl RiscVRuntime {
         let syscall_env = Arc::new(Mutex::new(SyscallEnv {
             state: state.clone(),
             memory: None, // Will be set after instance creation
-            exit_flag: None, // Will be set after instance creation
+            set_exit_flag_func: None, // Will be set after instance creation
             wasi_env: None, // Will be set after WASI initialization
         }));
 
@@ -209,10 +207,10 @@ impl RiscVRuntime {
             syscall_env.lock().unwrap().memory = Some(memory.clone());
         }
 
-        // Get exit_flag global if exported and store in environment
-        let exit_flag = instance.exports.get_global("exit_flag").ok().cloned();
-        if let Some(ref flag) = exit_flag {
-            syscall_env.lock().unwrap().exit_flag = Some(flag.clone());
+        // Get set_exit_flag function if exported and store in environment
+        let set_exit_flag_func = instance.exports.get_function("set_exit_flag").ok().cloned();
+        if let Some(ref func) = set_exit_flag_func {
+            syscall_env.lock().unwrap().set_exit_flag_func = Some(func.clone());
         }
 
         // Store WASI environment in syscall_env if it was initialized successfully
@@ -225,7 +223,7 @@ impl RiscVRuntime {
             instance,
             store,
             state,
-            exit_flag,
+            set_exit_flag_func,
         })
     }
 
@@ -315,13 +313,13 @@ impl RiscVRuntime {
             93 => {
                 // exit(status) - set exit flag to break interpreter loop
                 eprintln!("DEBUG: exit syscall called with status={}", arg1);
-                // Get exit flag (need to do this before locking other things)
-                let exit_flag = {
+                // Get set_exit_flag function (need to do this before locking other things)
+                let set_exit_flag_func = {
                     let syscall_env = env.data().lock().unwrap();
-                    syscall_env.exit_flag.clone()
+                    syscall_env.set_exit_flag_func.clone()
                 };
-                if let Some(exit_flag) = exit_flag {
-                    exit_flag.set(&mut env, wasmer::Value::I32(1)).ok();
+                if let Some(func) = set_exit_flag_func {
+                    func.call(&mut env, &[wasmer::Value::I32(1)]).ok();
                 }
                 arg1 // Return exit status
             }
@@ -553,11 +551,12 @@ impl RuntimeBuilder {
         // Create store for this runtime instance
         let store = Store::new(self.wasm_builder.engine().clone());
 
-        // Create runtime with compiled native code
-        RiscVRuntime::new(store, module, state)
+        self.build_runtime_from_module(module, store, state)
     }
 
     /// Build a runtime from WASM bytecode
+    ///
+    /// This compiles WASM → native code using Cranelift
     pub fn build_from_wasm(
         &self,
         wasm_bytes: &[u8],
@@ -568,6 +567,17 @@ impl RuntimeBuilder {
 
         // Create store for this runtime instance
         let store = Store::new(self.wasm_builder.engine().clone());
+
+        self.build_runtime_from_module(module, store, state)
+    }
+
+    /// Helper method to build runtime from a compiled module
+    fn build_runtime_from_module(
+        &self,
+        module: Module,
+        mut store: Store,
+        state: Arc<Mutex<crate::middleend::RiscVState>>,
+    ) -> Result<RiscVRuntime, Box<dyn std::error::Error>> {
 
         // Create runtime with compiled native code
         RiscVRuntime::new(store, module, state)

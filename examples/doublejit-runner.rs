@@ -128,6 +128,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
   (import "env" "syscall" (func $syscall (param i64 i64 i64 i64 i64 i64 i64) (result i64)))
   (import "env" "debug_print" (func $debug_print (param i32)))
 
+  ;; Import WASI functions for direct syscall translation
+  (import "wasi_snapshot_preview1" "fd_write" (func $wasi_fd_write (param i32 i32 i32 i32) (result i32)))
+  (import "wasi_snapshot_preview1" "fd_read" (func $wasi_fd_read (param i32 i32 i32 i32) (result i32)))
+  (import "wasi_snapshot_preview1" "proc_exit" (func $wasi_proc_exit (param i32)))
+
   ;; Memory: 2048 pages initially (128MB), max 4096 pages (256MB)
   ;; This accommodates programs that expect larger address spaces (stack, heap, TLS)
   (memory (export "memory") 2048 4096)
@@ -181,11 +186,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
   (global $vstart (mut i64) (i64.const 0))
   (global $vlenb (mut i64) (i64.const 256))
 
-  ;; Exit flag - set to 1 when program should exit (exported so syscall handler can set it)
-  (global $exit_flag (export "exit_flag") (mut i32) (i32.const 0))
+  ;; Exit flag - set to 1 when program should exit
+  (global $exit_flag (mut i32) (i32.const 0))
 
   ;; Instruction execution counter (for debugging infinite loops)
-  (global $instr_count (export "instr_count") (mut i64) (i64.const 0))
+  (global $instr_count (mut i64) (i64.const 0))
+
+  ;; Accessor functions for exit_flag and instr_count (exported as immutable functions)
+  (func $get_exit_flag (export "get_exit_flag") (result i32)
+    global.get $exit_flag
+  )
+
+  (func $set_exit_flag (export "set_exit_flag") (param $value i32)
+    local.get $value
+    global.set $exit_flag
+  )
+
+  (func $get_instr_count (export "get_instr_count") (result i64)
+    global.get $instr_count
+  )
 
   ;; Helper function: Translate RISC-V virtual address to WASM linear memory offset
   (func $vaddr_to_offset (param $vaddr i64) (result i32)
@@ -197,6 +216,57 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     i64.const {}
     i64.add
     i32.wrap_i64
+  )
+
+  ;; WASI write wrapper: adapt RISC-V write(fd, buf, count) to WASI fd_write
+  (func $wasi_write (param $fd i64) (param $buf i64) (param $count i64) (result i64)
+    (local $iovec_ptr i32)
+    (local $nwritten_ptr i32)
+    (local $result i32)
+
+    ;; Allocate space for iovec at a high memory address (0x7ff0000)
+    i32.const 0x7ff0000
+    local.set $iovec_ptr
+
+    ;; Allocate space for nwritten result (0x7ff0010)
+    i32.const 0x7ff0010
+    local.set $nwritten_ptr
+
+    ;; Write iovec structure: [buf_ptr, buf_len]
+    local.get $iovec_ptr
+    local.get $buf
+    call $vaddr_to_offset
+    i32.store
+
+    local.get $iovec_ptr
+    i32.const 4
+    i32.add
+    local.get $count
+    i32.wrap_i64
+    i32.store
+
+    ;; Call WASI fd_write(fd, iovec_ptr, iovec_count=1, nwritten_ptr)
+    local.get $fd
+    i32.wrap_i64
+    local.get $iovec_ptr
+    i32.const 1  ;; iovec count
+    local.get $nwritten_ptr
+    call $wasi_fd_write
+    local.set $result
+
+    ;; Check result
+    local.get $result
+    i32.const 0
+    i32.eq
+    if (result i64)
+      ;; Success: return number of bytes written
+      local.get $nwritten_ptr
+      i32.load
+      i64.extend_i32_u
+    else
+      ;; Error: return -1
+      i64.const -1
+    end
   )
 
 {}
@@ -219,9 +289,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // ========================================================================
-    // STEP 4: Backend - Compile WAT to Native Code using Cranelift
+    // STEP 4: Backend - Compile WAT to Native Code using Singlepass
     // ========================================================================
-    println!("\n[4/5] ⚙️  Compiling to native code (Cranelift)...");
+    println!("\n[4/5] ⚙️  Compiling to native code (Singlepass)...");
 
     let runtime_builder = RuntimeBuilder::new()?;
     let state = Arc::new(Mutex::new(RiscVState::default()));
@@ -233,9 +303,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         s.memory_base = address_map.memory_base;
     }
 
-    // Compile WAT to native code
-    println!("      🔨 Compiling WASM bytecode to native x86-64/ARM...");
-    let mut runtime = match runtime_builder.build_from_wat(&complete_wat, state.clone()) {
+    // Compile WAT to WASM bytecode first
+    println!("      🔨 Compiling WAT to WASM bytecode...");
+    let wasm_bytes = match wasmer::wat2wasm(complete_wat.as_bytes()) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            eprintln!("\n❌ WAT to WASM conversion failed: {}", e);
+            eprintln!("\nGenerated WAT code:");
+            eprintln!("{}", complete_wat);
+            return Err(e.into());
+        }
+    };
+
+    println!("      ✓ WASM bytecode generated: {} bytes", wasm_bytes.len());
+
+    // Compile WASM to native code using Singlepass (no optimization needed)
+    println!("      🔨 Compiling WASM bytecode to native x86-64/ARM (Singlepass)...");
+    let mut runtime = match runtime_builder.build_from_wasm(&wasm_bytes, state.clone()) {
         Ok(rt) => {
             println!("      ✓ Native code compilation successful!");
             println!("      ✓ Target: {} architecture", std::env::consts::ARCH);
@@ -243,8 +327,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Err(e) => {
             eprintln!("\n❌ Compilation failed: {}", e);
-            eprintln!("\nGenerated WAT code:");
-            eprintln!("{}", complete_wat);
             return Err(e);
         }
     };
@@ -374,14 +456,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Execute the compiled native code
     let exit_code_result = runtime.execute();
 
-    // Get instruction count after execution
-    let instr_count_opt = runtime.instance().exports.get_global("instr_count").ok().cloned();
-    if let Some(instr_count_global) = instr_count_opt {
-        match instr_count_global.get(runtime.store_mut()) {
-            Value::I64(count) => {
-                eprintln!("\n╔═══════════════════════════════════════════════════════════════╗");
-                eprintln!("║  DEBUG: Executed {} instructions", count);
-                eprintln!("╚═══════════════════════════════════════════════════════════════╝");
+    // Get instruction count after execution (using accessor function)
+    let get_instr_count_func = runtime.instance().exports.get_function("get_instr_count").ok().cloned();
+    if let Some(func) = get_instr_count_func {
+        match func.call(runtime.store_mut(), &[]) {
+            Ok(results) if !results.is_empty() => {
+                if let Value::I64(count) = results[0] {
+                    eprintln!("\n╔═══════════════════════════════════════════════════════════════╗");
+                    eprintln!("║  DEBUG: Executed {} instructions", count);
+                    eprintln!("╚═══════════════════════════════════════════════════════════════╝");
+                }
             }
             _ => {}
         }

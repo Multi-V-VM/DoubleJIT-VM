@@ -638,9 +638,11 @@ impl WasmEmitter {
                 // a7 (x17) = syscall number
                 // a0-a5 (x10-x15) = arguments
                 // Result returned in a0 (x10)
+
+                // Generate a switch on syscall number to call WASI functions directly
                 writeln!(
                     &mut self.wat_code,
-                    "    ;; ECALL - RISC-V syscall\n    global.get $x17\n    global.get $x10\n    global.get $x11\n    global.get $x12\n    global.get $x13\n    global.get $x14\n    global.get $x15\n    call $syscall\n    global.set $x10"
+                    "    ;; ECALL - translate RISC-V syscall to WASI call\n    global.get $x17\n    i64.const 64\n    i64.eq\n    if\n      ;; write(fd, buf, count) -> fd_write\n      global.get $x10  ;; fd\n      global.get $x11  ;; buf\n      global.get $x12  ;; count\n      call $wasi_write\n      global.set $x10\n    else\n      global.get $x17\n      i64.const 93\n      i64.eq\n      if\n        ;; exit(status) -> proc_exit\n        global.get $x10\n        i32.wrap_i64\n        call $wasi_proc_exit\n        i64.const 0\n        global.set $x10\n      else\n        ;; Fallback to syscall handler for other syscalls\n        global.get $x17\n        global.get $x10\n        global.get $x11\n        global.get $x12\n        global.get $x13\n        global.get $x14\n        global.get $x15\n        call $syscall\n        global.set $x10\n      end\n    end"
                 )
                 .unwrap();
             }
