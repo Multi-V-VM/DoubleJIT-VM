@@ -1,2 +1,2 @@
-mod optimizer;
-mod regmap;
+pub mod optimizer;
+pub mod regmap;

@@ -642,7 +642,80 @@ impl WasmEmitter {
                 // Generate a switch on syscall number to call WASI functions directly
                 writeln!(
                     &mut self.wat_code,
-                    "    ;; ECALL - translate RISC-V syscall to WASI call\n    global.get $x17\n    i64.const 64\n    i64.eq\n    if\n      ;; write(fd, buf, count) -> fd_write\n      global.get $x10  ;; fd\n      global.get $x11  ;; buf\n      global.get $x12  ;; count\n      call $wasi_write\n      global.set $x10\n    else\n      global.get $x17\n      i64.const 93\n      i64.eq\n      if\n        ;; exit(status) -> proc_exit\n        global.get $x10\n        i32.wrap_i64\n        call $wasi_proc_exit\n        i64.const 0\n        global.set $x10\n      else\n        ;; Fallback to syscall handler for other syscalls\n        global.get $x17\n        global.get $x10\n        global.get $x11\n        global.get $x12\n        global.get $x13\n        global.get $x14\n        global.get $x15\n        call $syscall\n        global.set $x10\n      end\n    end"
+                    "    ;; ECALL - translate RISC-V syscall to WASI/stub call
+    global.get $x17
+    i64.const 64
+    i64.eq
+    if
+      ;; write(fd, buf, count) -> fd_write
+      global.get $x10  ;; fd
+      global.get $x11  ;; buf
+      global.get $x12  ;; count
+      call $wasi_write
+      global.set $x10
+    else
+      global.get $x17
+      i64.const 93
+      i64.eq
+      if
+        ;; exit(status) -> proc_exit
+        global.get $x10
+        i32.wrap_i64
+        call $wasi_proc_exit
+        i64.const 0
+        global.set $x10
+      else
+        global.get $x17
+        i64.const 94
+        i64.eq
+        if
+          ;; exit_group(status) -> proc_exit
+          global.get $x10
+          i32.wrap_i64
+          call $wasi_proc_exit
+          i64.const 0
+          global.set $x10
+        else
+          global.get $x17
+          i64.const 172
+          i64.eq
+          if
+            ;; getpid() -> return fixed PID
+            i64.const 1000
+            global.set $x10
+          else
+            global.get $x17
+            i64.const 178
+            i64.eq
+            if
+              ;; gettid() -> return fixed TID
+              i64.const 1000
+              global.set $x10
+            else
+              global.get $x17
+              i64.const 131
+              i64.eq
+              if
+                ;; sigaltstack(ss, old_ss) -> stub (success)
+                i64.const 0
+                global.set $x10
+              else
+                ;; Fallback to syscall handler for other syscalls
+                global.get $x17
+                global.get $x10
+                global.get $x11
+                global.get $x12
+                global.get $x13
+                global.get $x14
+                global.get $x15
+                call $syscall
+                global.set $x10
+              end
+            end
+          end
+        end
+      end
+    end"
                 )
                 .unwrap();
             }

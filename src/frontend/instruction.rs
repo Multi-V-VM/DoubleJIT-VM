@@ -2372,18 +2372,34 @@ impl Instruction {
     }
 }
 
-#[derive(Debug, Clone)]
+use crate::frontend::cache::CodeCache;
+
+#[derive()]
 pub struct InstructionIter<'a> {
     pub address: u64,
     pub memory_map: &'a Vec<Option<Page<'a>>>,
+    /// Optional cache for decoded instructions
+    pub cache: Option<&'a mut CodeCache>,
 }
 
 impl Iterator for InstructionIter<'_> {
     type Item = (u64, Instruction);
 
     fn next(&mut self) -> Option<Self::Item> {
+        let current_pc = self.address;
+
+        // Check cache first if available
+        if let Some(cache) = &mut self.cache {
+            if let Some(cached_instr) = cache.get_instruction(current_pc) {
+                // Cache hit! Return cached instruction and advance PC
+                let instr = cached_instr.clone();
+                self.address += 4; // Assume 4-byte instructions
+                return Some((current_pc, instr));
+            }
+        }
+
+        // Cache miss - decode instruction from memory
         let mut bytes = [0; 32];
-        //    self.address, &mut bytes
         let mut address = self.address;
         let mut read_len = 0;
         let mut data: &mut [u8] = &mut bytes;
@@ -2415,13 +2431,19 @@ impl Iterator for InstructionIter<'_> {
         }
 
         let instruction = Instruction::parse(&bytes[..read_len]);
+
+        // Cache the decoded instruction if cache is available
+        if let Some(cache) = &mut self.cache {
+            cache.cache_instruction(current_pc, instruction.clone());
+        }
+
         // Add assertion for incorect machine
-        // match instruction.instr {
-        //     Instr::RV32(_) => unsafe { assert_eq!(BIT_LENGTH, 0) },
-        //     Instr::RV64(_) => unsafe { assert_eq!(BIT_LENGTH, 1) },
-        //     Instr::RV128(_) => unsafe { assert_eq!(BIT_LENGTH, 2) },
-        //     Instr::NOP => {}
-        // }
+        match instruction.instr {
+            Instr::RV32(_) => unsafe { assert_eq!(BIT_LENGTH, 0) },
+            Instr::RV64(_) => unsafe { assert_eq!(BIT_LENGTH, 1) },
+            Instr::RV128(_) => unsafe { assert_eq!(BIT_LENGTH, 2) },
+            Instr::NOP => {}
+        }
         Some((address, instruction))
     }
 }

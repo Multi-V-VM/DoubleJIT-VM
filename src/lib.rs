@@ -11,4 +11,4 @@ pub mod frontend;
 pub mod middleend;
 pub mod backend;
 mod runtime;
-mod tools;
+pub mod tools;

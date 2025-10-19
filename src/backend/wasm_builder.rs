@@ -308,6 +308,9 @@ impl RiscVRuntime {
         arg5: i64,
         arg6: i64,
     ) -> i64 {
+        // Debug: log every syscall
+        eprintln!("SYSCALL: num={}, args=({}, {}, {}, {}, {}, {})", syscall_num, arg1, arg2, arg3, arg4, arg5, arg6);
+
         // Implement RISC-V Linux syscalls
         match syscall_num {
             93 => {
@@ -497,6 +500,107 @@ impl RiscVRuntime {
             261 => {
                 // prlimit64
                 0 // success (ignore)
+            }
+            94 => {
+                // exit_group(status) - terminate all threads in process
+                eprintln!("DEBUG: exit_group syscall called with status={}", arg1);
+                // Set exit flag like regular exit
+                let set_exit_flag_func = {
+                    let syscall_env = env.data().lock().unwrap();
+                    syscall_env.set_exit_flag_func.clone()
+                };
+                if let Some(func) = set_exit_flag_func {
+                    func.call(&mut env, &[wasmer::Value::I32(1)]).ok();
+                }
+                arg1 // Return exit status
+            }
+            131 => {
+                // sigaltstack(ss, old_ss) - set/get signal stack
+                eprintln!("DEBUG: sigaltstack syscall (stubbed)");
+                0 // success (stub - we don't use signal stacks)
+            }
+            172 => {
+                // getpid() - get process ID
+                // Return a fixed PID for now
+                eprintln!("DEBUG: getpid syscall");
+                1000 // Return fixed PID
+            }
+            178 => {
+                // gettid() - get thread ID
+                // Return a fixed TID for now
+                eprintln!("DEBUG: gettid syscall");
+                1000 // Return fixed TID (same as PID for single-threaded)
+            }
+            318 => {
+                // getrandom(buf, buflen, flags)
+                // Critical for libc initialization (stack canaries, ASLR)
+                let buf_addr = arg1 as u64;
+                let buf_len = arg2 as usize;
+                eprintln!("DEBUG: getrandom syscall: buf=0x{:x}, len={}", buf_addr, buf_len);
+
+                let memory = env.data().lock().unwrap().memory.clone();
+
+                if let Some(memory) = memory {
+                    let view = memory.view(&env);
+
+                    // Fill buffer with random data (or zeros if getrandom not available)
+                    for i in 0..buf_len {
+                        // Use a simple pseudo-random value based on index
+                        // In production, this should use actual random data
+                        let random_byte = ((i * 17 + 42) % 256) as u8;
+                        view.write_u8(buf_addr + i as u64, random_byte).ok();
+                    }
+                    buf_len as i64 // Return number of bytes written
+                } else {
+                    eprintln!("ERROR: No memory for getrandom");
+                    -1 // EFAULT
+                }
+            }
+            158 => {
+                // arch_prctl(code, addr) - x86-64 specific TLS setup
+                // code=0x1002 (ARCH_SET_FS), code=0x1003 (ARCH_GET_FS)
+                eprintln!("DEBUG: arch_prctl syscall: code=0x{:x}, addr=0x{:x}", arg1, arg2);
+                0 // Success (stub - WASM doesn't need TLS setup)
+            }
+            334 => {
+                // rseq(rseq, rseq_len, flags, sig) - restartable sequences
+                eprintln!("DEBUG: rseq syscall (stubbed)");
+                0 // Success (stub - not needed in WASM)
+            }
+            89 => {
+                // readlink(path, buf, bufsiz)
+                eprintln!("DEBUG: readlink syscall: path=0x{:x}, buf=0x{:x}, size={}", arg1, arg2, arg3);
+                -2 // ENOENT (file not found - we don't have a filesystem)
+            }
+            21 => {
+                // access(pathname, mode)
+                eprintln!("DEBUG: access syscall: path=0x{:x}, mode={}", arg1, arg2);
+                -2 // ENOENT (file not found)
+            }
+            17 => {
+                // getcwd(buf, size)
+                let buf_addr = arg1 as u64;
+                eprintln!("DEBUG: getcwd syscall: buf=0x{:x}, size={}", buf_addr, arg2);
+
+                let memory = env.data().lock().unwrap().memory.clone();
+
+                if let Some(memory) = memory {
+                    let view = memory.view(&env);
+                    let cwd = b"/\0"; // Return root directory
+
+                    // Write current directory to buffer
+                    for (i, &byte) in cwd.iter().enumerate() {
+                        view.write_u8(buf_addr + i as u64, byte).ok();
+                    }
+                    arg1 // Return buffer address on success
+                } else {
+                    -1 // EFAULT
+                }
+            }
+            179 => {
+                // sysinfo(info)
+                eprintln!("DEBUG: sysinfo syscall (stubbed)");
+                0 // Success (stub - return fake system info)
             }
             _ => {
                 // Check if syscall number looks like garbage (way too high)

@@ -24,5 +24,11 @@ crate-type = ["cdylib", "rlib"]
 [[example]]
 name = "doublejit-runner"
 
+[[example]]
+name = "cache_usage"
+
+[[example]]
+name = "perf_demo"
+
 [package.metadata.docs.rs]
 all-features = true

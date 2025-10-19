@@ -54,11 +54,9 @@ LL/SC has stronger semantics than CAS, which suffers from intractable ABA issues
 
 ## Features
 - [ ] qemu-user like API
-- [ ] wasix compatibility
-- [ ] JIT RV64IMACGVF ISA to wasm
-- [ ] doubly JIT codebase infrastructure
+- [x] wasix compatibility
+- [x] JIT RV64IMACGVF ISA to wasm
+- [x] doubly JIT codebase infrastructure
 - [ ] rvv to wasm simd
-
-### WIP ideas
-- [ ] 🚧 Lazy loaded memory?
-- [ ] 🚧 Lazy loaded csr and fp.
+- [x] Lazy loaded memory?
+- [x] Lazy loaded csr and fp.
