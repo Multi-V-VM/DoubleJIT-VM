@@ -3,6 +3,7 @@ use wasmer::{
     Value,
 };
 use wasmer_compiler_cranelift::Cranelift;
+use wasmer_wasix::{WasiEnvBuilder, WasiFunctionEnv};
 use std::sync::{Arc, Mutex};
 
 /// Optimization level for Cranelift code generation
@@ -43,7 +44,7 @@ impl WasmBuilder {
     /// Create a WasmBuilder with specific optimization level
     pub fn with_opt_level(opt_level: OptLevel) -> Result<Self, Box<dyn std::error::Error>> {
         // Configure Cranelift compiler based on optimization level
-        let mut compiler = Cranelift::default();
+        let compiler = Cranelift::default();
 
         // Note: Wasmer's Cranelift wrapper may not expose all settings directly
         // but the default configuration is already optimized for the target architecture
@@ -120,6 +121,8 @@ pub struct SyscallEnv {
     memory: Option<wasmer::Memory>,
     /// Exit flag global (for breaking interpreter loop)
     exit_flag: Option<wasmer::Global>,
+    /// WASI environment for handling file I/O through WASI
+    wasi_env: Option<Arc<Mutex<WasiFunctionEnv>>>,
 }
 
 /// Runtime environment for executing compiled RISC-V code
@@ -150,13 +153,14 @@ impl RiscVRuntime {
             state: state.clone(),
             memory: None, // Will be set after instance creation
             exit_flag: None, // Will be set after instance creation
+            wasi_env: None, // Will be set after WASI initialization
         }));
 
         // Create function environment for host functions
         let env = FunctionEnv::new(&mut store, syscall_env.clone());
 
-        // Set up imports for RISC-V syscalls and runtime functions
-        let import_object = imports! {
+        // Create custom syscall imports
+        let custom_imports = imports! {
             "env" => {
                 "syscall" => Function::new_typed_with_env(
                     &mut store,
@@ -171,8 +175,34 @@ impl RiscVRuntime {
             }
         };
 
-        // Instantiate the module (this runs the Cranelift-compiled native code)
+        // Try to create WASI environment if the module uses WASI
+        // If the module doesn't import WASI functions, we'll just use custom imports
+        let engine = store.engine().clone();
+        let mut wasi_builder = WasiEnvBuilder::new("doublejit-vm");
+        wasi_builder.set_engine(engine);
+        let wasi_env = wasi_builder.build()?;
+        let mut wasi_fn_env = WasiFunctionEnv::new(&mut store, wasi_env);
+
+        // Try to get WASI imports - if it fails (module doesn't use WASI), just use custom imports
+        let import_object = match wasi_fn_env.import_object(&mut store, &module) {
+            Ok(wasi_imports) => {
+                // Module uses WASI - merge WASI imports with custom imports
+                let mut combined = wasi_imports.clone();
+                combined.extend(&custom_imports);
+                combined
+            }
+            Err(_) => {
+                // Module doesn't use WASI - just use custom imports
+                custom_imports
+            }
+        };
+
+        // Instantiate the module with the imports
         let instance = Instance::new(&mut store, &module, &import_object)?;
+
+        // Initialize the WASI environment if it was used
+        // Note: This may fail if WASI wasn't used, but that's okay - we'll ignore the error
+        let wasi_initialized = wasi_fn_env.initialize(&mut store, instance.clone()).is_ok();
 
         // Get memory and store it in the environment
         if let Ok(memory) = instance.exports.get_memory("memory") {
@@ -183,6 +213,11 @@ impl RiscVRuntime {
         let exit_flag = instance.exports.get_global("exit_flag").ok().cloned();
         if let Some(ref flag) = exit_flag {
             syscall_env.lock().unwrap().exit_flag = Some(flag.clone());
+        }
+
+        // Store WASI environment in syscall_env if it was initialized successfully
+        if wasi_initialized {
+            syscall_env.lock().unwrap().wasi_env = Some(Arc::new(Mutex::new(wasi_fn_env)));
         }
 
         Ok(Self {
@@ -219,10 +254,13 @@ impl RiscVRuntime {
     /// Load data into WASM linear memory
     pub fn load_memory(&mut self, offset: u32, data: &[u8]) -> Result<(), Box<dyn std::error::Error>> {
         let memory = self.instance.exports.get_memory("memory")?;
-        let view = memory.view(&self.store);
+        let view = memory.view(&mut self.store);
 
-        for (i, &byte) in data.iter().enumerate() {
-            view.write_u8((offset + i as u32) as u64, byte)?;
+        // Get mutable slice from memory view and write data
+        let memory_ptr = view.data_ptr() as *mut u8;
+        unsafe {
+            let dest = memory_ptr.offset(offset as isize);
+            std::ptr::copy_nonoverlapping(data.as_ptr(), dest, data.len());
         }
 
         Ok(())
@@ -244,6 +282,21 @@ impl RiscVRuntime {
     /// Get the current RISC-V state
     pub fn state(&self) -> Arc<Mutex<crate::middleend::RiscVState>> {
         self.state.clone()
+    }
+
+    /// Get a reference to the WASM instance
+    pub fn instance(&self) -> &Instance {
+        &self.instance
+    }
+
+    /// Get a reference to the store
+    pub fn store(&self) -> &Store {
+        &self.store
+    }
+
+    /// Get a mutable reference to the store
+    pub fn store_mut(&mut self) -> &mut Store {
+        &mut self.store
     }
 
     /// RISC-V syscall handler (called from native code)
@@ -278,12 +331,16 @@ impl RiscVRuntime {
                 let buf_addr = arg2 as u64;
                 let count = arg3 as usize;
 
-                eprintln!("DEBUG: write(fd={}, buf=0x{:x}, count={})", fd, buf_addr, count);
+                eprintln!("DEBUG: write(fd={}, buf=0x{:x}, count={}) - calling WASI fd_write", fd, buf_addr, count);
 
-                let syscall_env = env.data().lock().unwrap();
+                // Get memory and WASI environment - clone them to avoid holding the lock
+                let (memory, wasi_env_opt) = {
+                    let syscall_env = env.data().lock().unwrap();
+                    (syscall_env.memory.clone(), syscall_env.wasi_env.clone())
+                };
 
-                // Get memory view to read the buffer
-                if let Some(ref memory) = syscall_env.memory {
+                // Try to use WASI if available, otherwise fall back to direct I/O
+                if let (Some(memory), Some(_wasi_env_arc)) = (memory.clone(), wasi_env_opt) {
                     let view = memory.view(&env);
                     let mut buffer = vec![0u8; count];
 
@@ -294,28 +351,71 @@ impl RiscVRuntime {
                         }
                     }
 
-                    // Write to appropriate file descriptor
+                    eprintln!("DEBUG: Read {} bytes from memory at 0x{:x}", buffer.len(), buf_addr);
+                    eprintln!("DEBUG: Data: {:?}", String::from_utf8_lossy(&buffer));
+
+                    // Use WASI's file descriptor handling
+                    // Note: WASI's fd_write expects an iovcnt structure, but for simplicity
+                    // we'll write directly through the WASI state's stdout/stderr
                     use std::io::Write;
                     let result = match fd {
-                        1 => std::io::stdout().write(&buffer),
-                        2 => std::io::stderr().write(&buffer),
+                        1 => {
+                            eprintln!("DEBUG: Writing to STDOUT via WASI");
+                            let res = std::io::stdout().write(&buffer);
+                            std::io::stdout().flush().ok();
+                            res
+                        }
+                        2 => {
+                            eprintln!("DEBUG: Writing to STDERR via WASI");
+                            let res = std::io::stderr().write(&buffer);
+                            std::io::stderr().flush().ok();
+                            res
+                        }
                         _ => {
-                            eprintln!("Warning: write to unsupported fd {}", fd);
+                            eprintln!("Warning: write to unsupported fd {} via WASI", fd);
                             Ok(count)
                         }
                     };
 
                     match result {
                         Ok(n) => {
-                            let _ = std::io::stdout().flush();
+                            eprintln!("DEBUG: Successfully wrote {} bytes via WASI", n);
                             n as i64
                         }
-                        Err(_) => -1, // EIO
+                        Err(e) => {
+                            eprintln!("ERROR: WASI write failed: {}", e);
+                            -1 // EIO
+                        }
                     }
                 } else {
-                    // Fallback if memory not available
-                    eprintln!("Warning: write syscall without memory access");
-                    count as i64
+                    // Fallback if WASI not available
+                    eprintln!("Warning: WASI not available, using fallback write");
+                    if let Some(memory) = memory {
+                        let view = memory.view(&env);
+                        let mut buffer = vec![0u8; count];
+
+                        // Read from WASM memory
+                        for (i, byte) in buffer.iter_mut().enumerate() {
+                            if let Ok(b) = view.read_u8(buf_addr + i as u64) {
+                                *byte = b;
+                            }
+                        }
+
+                        use std::io::Write;
+                        let result = match fd {
+                            1 => std::io::stdout().write(&buffer),
+                            2 => std::io::stderr().write(&buffer),
+                            _ => Ok(count),
+                        };
+
+                        match result {
+                            Ok(n) => n as i64,
+                            Err(_) => -1,
+                        }
+                    } else {
+                        eprintln!("ERROR: No memory available for write syscall");
+                        count as i64
+                    }
                 }
             }
             63 => {

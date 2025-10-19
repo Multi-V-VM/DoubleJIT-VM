@@ -107,8 +107,9 @@ impl AddressMap {
             let is_bss = section_name.contains("bss");
             let is_data = section_name.contains("data") || section_name.contains("rodata");
             let is_text = section_name.contains("text");
+            let is_got = section_name.contains("got"); // Global Offset Table
 
-            if !is_bss && !is_data && !is_text {
+            if !is_bss && !is_data && !is_text && !is_got {
                 // Skip sections we don't care about
                 continue;
             }

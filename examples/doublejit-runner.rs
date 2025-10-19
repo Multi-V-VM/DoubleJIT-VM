@@ -3,8 +3,10 @@ use doublejit_vm::frontend::instruction::Instruction;
 use doublejit_vm::middleend::{AddressMap, WasmEmitter, RiscVState};
 use doublejit_vm::backend::RuntimeBuilder;
 use std::sync::{Arc, Mutex};
+use wasmer::Value;
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Parse command line arguments
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
@@ -130,6 +132,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
   ;; This accommodates programs that expect larger address spaces (stack, heap, TLS)
   (memory (export "memory") 2048 4096)
 
+  ;; Declare WASI version for wasix (using _start as entry point marker for wasip1)
+  (export "_start" (func $main))
+
   ;; Globals for RISC-V register file (x0-x31)
   (global $x0 (mut i64) (i64.const 0))
   (global $x1 (mut i64) (i64.const 0))
@@ -179,6 +184,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
   ;; Exit flag - set to 1 when program should exit (exported so syscall handler can set it)
   (global $exit_flag (export "exit_flag") (mut i32) (i32.const 0))
 
+  ;; Instruction execution counter (for debugging infinite loops)
+  (global $instr_count (export "instr_count") (mut i64) (i64.const 0))
+
   ;; Helper function: Translate RISC-V virtual address to WASM linear memory offset
   (func $vaddr_to_offset (param $vaddr i64) (result i32)
     ;; Just do the translation - trust that the address is valid
@@ -202,6 +210,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     i32.const 0
   )
 )"#, vaddr_base, address_map.memory_base, function_code, entry_point);
+
+    // Debug: optionally print WAT code
+    if std::env::var("PRINT_WAT").is_ok() {
+        eprintln!("\n========== Generated WAT Code ==========");
+        eprintln!("{}", complete_wat);
+        eprintln!("========================================\n");
+    }
 
     // ========================================================================
     // STEP 4: Backend - Compile WAT to Native Code using Cranelift
@@ -357,8 +372,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("╚══════════════════════════════════════════════════════════╝\n");
 
     // Execute the compiled native code
-    match runtime.execute() {
+    let exit_code_result = runtime.execute();
+
+    // Get instruction count after execution
+    let instr_count_opt = runtime.instance().exports.get_global("instr_count").ok().cloned();
+    if let Some(instr_count_global) = instr_count_opt {
+        match instr_count_global.get(runtime.store_mut()) {
+            Value::I64(count) => {
+                eprintln!("\n╔═══════════════════════════════════════════════════════════════╗");
+                eprintln!("║  DEBUG: Executed {} instructions", count);
+                eprintln!("╚═══════════════════════════════════════════════════════════════╝");
+            }
+            _ => {}
+        }
+    }
+
+    match exit_code_result {
         Ok(exit_code) => {
+
             println!("\n╔══════════════════════════════════════════════════════════╗");
             println!("║                  Execution Complete                      ║");
             println!("╚══════════════════════════════════════════════════════════╝");

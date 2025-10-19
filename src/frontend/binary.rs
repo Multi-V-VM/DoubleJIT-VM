@@ -129,15 +129,7 @@ impl<'a> Binary<'a> {
             }
         }
         let mut section_iter = elf.section_iter();
-        dbg!(
-            "Section header size: {}",
-            elf.header_part2.get_sh_count() - 1
-        );
-        section_iter.next();
-        for sh in section_iter {
-            dbg!(" {},", sh.get_data(&elf));
-        }
-        
+        section_iter.next(); // skip null section
         Ok(Self { pages })
     }
 }

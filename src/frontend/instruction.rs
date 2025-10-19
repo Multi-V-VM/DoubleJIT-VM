@@ -1711,7 +1711,7 @@ macro_rules! j {
 macro_rules! u {
     ($type:ident,  $opcode1:ident, $opcode2:ident,  $bit:expr, $reg:ident) => {{
         let rd = Rd($reg(rd($bit).try_into().unwrap()));
-        let imm = Imm32::<31, 12>::from(itype_immediate($bit) as u32);
+        let imm = Imm32::<31, 12>::from(utype_immediate($bit) as u32);
         $type!($opcode1, $opcode2, rd, imm)
     }};
 }

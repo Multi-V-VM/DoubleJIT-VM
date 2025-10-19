@@ -78,12 +78,13 @@ impl WasmEmitter {
         // Wrap instruction in PC check - only execute if PC matches
         writeln!(
             &mut self.wat_code,
-            "      ;; PC=0x{:08x}: {:?}\n      global.get $pc\n      i64.const {}\n      i64.eq\n      if",
+            "      ;; PC=0x{:08x}: {:?}\n      global.get $pc\n      i64.const {}\n      i64.eq\n      if\n        ;; Increment execution counter\n        global.get $instr_count\n        i64.const 1\n        i64.add\n        global.set $instr_count",
             pc, instr.instr, pc as i64
         )
         .unwrap();
 
         // Check if this instruction modifies PC (branches/jumps)
+        // Note: RV64 programs also use RV32I base instructions including jumps/branches
         let modifies_pc = matches!(
             &instr.instr,
             Instr::RV32(rv32) if matches!(rv32,
@@ -178,36 +179,62 @@ impl WasmEmitter {
 
             JAL(Rd(rd), imm) => {
                 // rd = pc + 4; pc = pc + imm
+                // Note: jtype_immediate() already returns the full sign-extended offset
+                // Note: x0 is always zero, so don't write to it
                 let rd_num = self.reg_num(rd)?;
-                let imm_val = imm.decode() as i32;
-                writeln!(
-                    &mut self.wat_code,
-                    "    ;; Save return address\n    global.get $pc\n    i64.const 4\n    i64.add\n    global.set $x{}\n    ;; Jump\n    global.get $pc\n    i64.const {}\n    i64.add\n    global.set $pc",
-                    rd_num, imm_val as i64
-                )
-                .unwrap();
+                let imm_val = imm.0 as i32;
+
+                if rd_num == 0 {
+                    // x0 is always zero - don't save return address
+                    writeln!(
+                        &mut self.wat_code,
+                        "    ;; Jump (no return address saved to x0)\n    global.get $pc\n    i64.const {}\n    i64.add\n    global.set $pc",
+                        imm_val as i64
+                    )
+                    .unwrap();
+                } else {
+                    writeln!(
+                        &mut self.wat_code,
+                        "    ;; Save return address\n    global.get $pc\n    i64.const 4\n    i64.add\n    global.set $x{}\n    ;; Jump\n    global.get $pc\n    i64.const {}\n    i64.add\n    global.set $pc",
+                        rd_num, imm_val as i64
+                    )
+                    .unwrap();
+                }
             }
 
             JALR(Rd(rd), Rs1(rs1), imm) => {
                 // rd = pc + 4; pc = (rs1 + imm) & ~1
+                // Note: x0 is always zero, so don't write to it
                 let rd_num = self.reg_num(rd)?;
                 let rs1_num = self.reg_num(rs1)?;
-                let imm_val = imm.decode() as i32;
-                writeln!(
-                    &mut self.wat_code,
-                    "    ;; Save return address\n    global.get $pc\n    i64.const 4\n    i64.add\n    global.set $x{}\n    ;; Compute target\n    global.get $x{}\n    i64.const {}\n    i64.add\n    i64.const -2\n    i64.and\n    global.set $pc",
-                    rd_num, rs1_num, imm_val as i64
-                )
-                .unwrap();
+                let imm_val = imm.decode_sext();
+
+                if rd_num == 0 {
+                    // x0 is always zero - don't save return address
+                    writeln!(
+                        &mut self.wat_code,
+                        "    ;; Compute target (no return address saved to x0)\n    global.get $x{}\n    i64.const {}\n    i64.add\n    i64.const -2\n    i64.and\n    global.set $pc",
+                        rs1_num, imm_val as i64
+                    )
+                    .unwrap();
+                } else {
+                    writeln!(
+                        &mut self.wat_code,
+                        "    ;; Save return address\n    global.get $pc\n    i64.const 4\n    i64.add\n    global.set $x{}\n    ;; Compute target\n    global.get $x{}\n    i64.const {}\n    i64.add\n    i64.const -2\n    i64.and\n    global.set $pc",
+                        rd_num, rs1_num, imm_val as i64
+                    )
+                    .unwrap();
+                }
             }
 
             BEQ(Rs1(rs1), Rs2(rs2), imm) => {
+                // Note: btype_immediate() already returns the full sign-extended offset
                 let rs1_num = self.reg_num(rs1)?;
                 let rs2_num = self.reg_num(rs2)?;
-                let imm_val = imm.decode() as i32;
+                let imm_val = imm.0 as i32;
                 writeln!(
                     &mut self.wat_code,
-                    "    global.get $x{}\n    global.get $x{}\n    i64.eq\n    if\n      global.get $pc\n      i64.const {}\n      i64.add\n      global.set $pc\n    end",
+                    "    global.get $x{}\n    global.get $x{}\n    i64.eq\n    if\n      global.get $pc\n      i64.const {}\n      i64.add\n      global.set $pc\n    else\n      global.get $pc\n      i64.const 4\n      i64.add\n      global.set $pc\n    end",
                     rs1_num, rs2_num, imm_val as i64
                 )
                 .unwrap();
@@ -216,10 +243,10 @@ impl WasmEmitter {
             BNE(Rs1(rs1), Rs2(rs2), imm) => {
                 let rs1_num = self.reg_num(rs1)?;
                 let rs2_num = self.reg_num(rs2)?;
-                let imm_val = imm.decode() as i32;
+                let imm_val = imm.0 as i32;
                 writeln!(
                     &mut self.wat_code,
-                    "    global.get $x{}\n    global.get $x{}\n    i64.ne\n    if\n      global.get $pc\n      i64.const {}\n      i64.add\n      global.set $pc\n    end",
+                    "    global.get $x{}\n    global.get $x{}\n    i64.ne\n    if\n      global.get $pc\n      i64.const {}\n      i64.add\n      global.set $pc\n    else\n      global.get $pc\n      i64.const 4\n      i64.add\n      global.set $pc\n    end",
                     rs1_num, rs2_num, imm_val as i64
                 )
                 .unwrap();
@@ -228,10 +255,10 @@ impl WasmEmitter {
             BLT(Rs1(rs1), Rs2(rs2), imm) => {
                 let rs1_num = self.reg_num(rs1)?;
                 let rs2_num = self.reg_num(rs2)?;
-                let imm_val = imm.decode() as i32;
+                let imm_val = imm.0 as i32;
                 writeln!(
                     &mut self.wat_code,
-                    "    global.get $x{}\n    global.get $x{}\n    i64.lt_s\n    if\n      global.get $pc\n      i64.const {}\n      i64.add\n      global.set $pc\n    end",
+                    "    global.get $x{}\n    global.get $x{}\n    i64.lt_s\n    if\n      global.get $pc\n      i64.const {}\n      i64.add\n      global.set $pc\n    else\n      global.get $pc\n      i64.const 4\n      i64.add\n      global.set $pc\n    end",
                     rs1_num, rs2_num, imm_val as i64
                 )
                 .unwrap();
@@ -240,10 +267,10 @@ impl WasmEmitter {
             BGE(Rs1(rs1), Rs2(rs2), imm) => {
                 let rs1_num = self.reg_num(rs1)?;
                 let rs2_num = self.reg_num(rs2)?;
-                let imm_val = imm.decode() as i32;
+                let imm_val = imm.0 as i32;
                 writeln!(
                     &mut self.wat_code,
-                    "    global.get $x{}\n    global.get $x{}\n    i64.ge_s\n    if\n      global.get $pc\n      i64.const {}\n      i64.add\n      global.set $pc\n    end",
+                    "    global.get $x{}\n    global.get $x{}\n    i64.ge_s\n    if\n      global.get $pc\n      i64.const {}\n      i64.add\n      global.set $pc\n    else\n      global.get $pc\n      i64.const 4\n      i64.add\n      global.set $pc\n    end",
                     rs1_num, rs2_num, imm_val as i64
                 )
                 .unwrap();
@@ -252,10 +279,10 @@ impl WasmEmitter {
             BLTU(Rs1(rs1), Rs2(rs2), imm) => {
                 let rs1_num = self.reg_num(rs1)?;
                 let rs2_num = self.reg_num(rs2)?;
-                let imm_val = imm.decode() as i32;
+                let imm_val = imm.0 as i32;
                 writeln!(
                     &mut self.wat_code,
-                    "    global.get $x{}\n    global.get $x{}\n    i64.lt_u\n    if\n      global.get $pc\n      i64.const {}\n      i64.add\n      global.set $pc\n    end",
+                    "    global.get $x{}\n    global.get $x{}\n    i64.lt_u\n    if\n      global.get $pc\n      i64.const {}\n      i64.add\n      global.set $pc\n    else\n      global.get $pc\n      i64.const 4\n      i64.add\n      global.set $pc\n    end",
                     rs1_num, rs2_num, imm_val as i64
                 )
                 .unwrap();
@@ -264,10 +291,10 @@ impl WasmEmitter {
             BGEU(Rs1(rs1), Rs2(rs2), imm) => {
                 let rs1_num = self.reg_num(rs1)?;
                 let rs2_num = self.reg_num(rs2)?;
-                let imm_val = imm.decode() as i32;
+                let imm_val = imm.0 as i32;
                 writeln!(
                     &mut self.wat_code,
-                    "    global.get $x{}\n    global.get $x{}\n    i64.ge_u\n    if\n      global.get $pc\n      i64.const {}\n      i64.add\n      global.set $pc\n    end",
+                    "    global.get $x{}\n    global.get $x{}\n    i64.ge_u\n    if\n      global.get $pc\n      i64.const {}\n      i64.add\n      global.set $pc\n    else\n      global.get $pc\n      i64.const 4\n      i64.add\n      global.set $pc\n    end",
                     rs1_num, rs2_num, imm_val as i64
                 )
                 .unwrap();
