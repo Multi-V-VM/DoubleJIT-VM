@@ -51,6 +51,25 @@ impl WasmEmitter {
         writeln!(&mut self.wat_code, "      if").unwrap();
         writeln!(&mut self.wat_code, "        return  ;; Exit function if exit_flag is set").unwrap();
         writeln!(&mut self.wat_code, "      end").unwrap();
+
+        // Watchdog at loop level: increments even if no instruction matches current PC
+        writeln!(&mut self.wat_code, "      ;; Loop-level watchdog increment").unwrap();
+        writeln!(&mut self.wat_code, "      global.get $instr_count").unwrap();
+        writeln!(&mut self.wat_code, "      i64.const 1").unwrap();
+        writeln!(&mut self.wat_code, "      i64.add").unwrap();
+        writeln!(&mut self.wat_code, "      global.set $instr_count").unwrap();
+        // If PC becomes 0 unexpectedly, re-seed from $entry_pc (provided by embedding runtime)
+        writeln!(&mut self.wat_code, "      ;; Re-seed PC if zero").unwrap();
+        writeln!(&mut self.wat_code, "      global.get $pc").unwrap();
+        writeln!(&mut self.wat_code, "      i64.eqz").unwrap();
+        writeln!(&mut self.wat_code, "      if").unwrap();
+        writeln!(&mut self.wat_code, "        global.get $entry_pc").unwrap();
+        writeln!(&mut self.wat_code, "        global.set $pc").unwrap();
+        writeln!(&mut self.wat_code, "      end").unwrap();
+        writeln!(
+            &mut self.wat_code,
+            "      ;; Print PC every 4096 loops (when idle)\n      global.get $instr_count\n      i64.const 4096\n      i64.rem_u\n      i64.eqz\n      if\n        global.get $pc\n        i32.wrap_i64\n        call $debug_print\n      end"
+        ).unwrap();
     }
 
     /// End the loop with exit flag check
@@ -87,6 +106,13 @@ impl WasmEmitter {
             &mut self.wat_code,
             "      ;; PC=0x{:08x}: {:?}\n      global.get $pc\n      i64.const {}\n      i64.eq\n      if\n        ;; Increment execution counter\n        global.get $instr_count\n        i64.const 1\n        i64.add\n        global.set $instr_count",
             pc, instr.instr, pc as i64
+        )
+        .unwrap();
+
+        // Watchdog: every 1,000,000 instructions print current PC
+        writeln!(
+            &mut self.wat_code,
+            "        ;; Watchdog: print PC every 8,192 instructions\n        global.get $instr_count\n        i64.const 8192\n        i64.rem_u\n        i64.eqz\n        if\n          global.get $pc\n          i32.wrap_i64\n          call $debug_print\n        end"
         )
         .unwrap();
 

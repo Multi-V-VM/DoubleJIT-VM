@@ -58,11 +58,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut total_instructions = 0;
     let mut translated_instructions = 0;
 
-    // Find and translate text sections
+    // Find and translate all executable sections (SHF_EXECINSTR)
     for section in elf_file.section_iter() {
         let section_name = section.get_name(&elf_file).unwrap_or("");
 
-        if section_name.contains("text") {
+        // Check SHF_EXECINSTR (0x4)
+        let is_exec = match section {
+            doublejit_vm::frontend::elf::SectionHeader::SectionHeader32(h) => (h.flags as u64 & 0x4) != 0,
+            doublejit_vm::frontend::elf::SectionHeader::SectionHeader64(h) => (h.flags & 0x4) != 0,
+        };
+
+        if is_exec {
             println!("      📝 Processing section: {}", section_name);
 
             let (section_data, section_vaddr) = match section {
@@ -80,7 +86,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             };
 
-            // CRITICAL FIX: PC must start at the section's virtual address, not entry point!
+            // CRITICAL: PC must start at each section's virtual address for matching
             let mut pc = section_vaddr;
             let mut offset = 0;
             while offset + 4 <= section_data.len() {
@@ -145,6 +151,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
   (export "_start" (func $main))
 
   ;; Globals for RISC-V register file (x0-x31)
+  ;; Entry point saved for watchdog/PC re-seed
+  (global $entry_pc (mut i64) (i64.const {}))
   (global $x0 (mut i64) (i64.const 0))
   (global $x1 (mut i64) (i64.const 0))
   (global $x2 (mut i64) (i64.const 0))
@@ -319,7 +327,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     call $translated_code
     i32.const 0
   )
-)"#, vaddr_base, address_map.memory_base, function_code, entry_point);
+)"#, entry_point, vaddr_base, address_map.memory_base, function_code, entry_point);
 
     // Debug: optionally print WAT code
     if std::env::var("PRINT_WAT").is_ok() {
@@ -474,24 +482,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     runtime.load_memory(current_addr as u32, &[0u8; 16])?;
 
     // CRITICAL for glibc: AT_PHDR = 3 (program headers address)
-    // Program headers are at offset 0x40 in the ELF file, loaded at vaddr 0x10000
-    // So the virtual address is 0x10000 + 0x40 = 0x10040
-    let phdr_vaddr = 0x10040u64; // Virtual address of program headers in memory
+    // Compute from ELF header: vaddr_base (0x10000) + e_phoff
+    let phoff = elf_file.header_part2.get_ph_offset();
+    let phdr_vaddr = 0x10000u64 + phoff; // Virtual address of program headers in memory
     current_addr -= 8;
     runtime.load_memory(current_addr as u32, &phdr_vaddr.to_le_bytes())?; // phdr address
     current_addr -= 8;
     runtime.load_memory(current_addr as u32, &3u64.to_le_bytes())?; // AT_PHDR
 
     // AT_PHENT = 4 (size of program header entry)
-    let phent_size = 56u64; // Standard size for ELF64 program header entry (Elf64_Phdr)
+    let phent_size = elf_file.header_part2.get_ph_entry_size() as u64; // size of Elf64_Phdr
     current_addr -= 8;
     runtime.load_memory(current_addr as u32, &phent_size.to_le_bytes())?; // phent size
     current_addr -= 8;
     runtime.load_memory(current_addr as u32, &4u64.to_le_bytes())?; // AT_PHENT
 
     // AT_PHNUM = 5 (number of program headers)
-    // For add_test: 6 program headers
-    let phnum = 6u64;
+    let phnum = elf_file.header_part2.get_ph_count() as u64;
     current_addr -= 8;
     runtime.load_memory(current_addr as u32, &phnum.to_le_bytes())?; // phnum
     current_addr -= 8;
@@ -593,18 +600,56 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let final_sp = current_addr;
 
     // Set up Thread Local Storage (TLS)
-    // In RISC-V, tp (x4) points to the Thread Control Block (TCB)
-    // TLS variables are accessed at negative offsets from tp
-    // We need to allocate space for .tdata and .tbss sections
+    // RISC-V uses TP-relative addressing: address = tp + tprel(symbol)
+    // Place tp at the START of the TLS block and layout .tdata then .tbss
+    let mut tdata_size: usize = 0;
+    let mut tdata_bytes: Vec<u8> = Vec::new();
+    let mut tbss_size: usize = 0;
 
-    // Allocate TLS area above the stack (should be at a high address)
-    let tls_size = 4096u64; // 4KB for TLS (more than enough for small programs)
-    let tls_area_end = current_addr - 256; // Leave gap between stack and TLS
-    let tls_area_start = tls_area_end - tls_size;
-    let tp = tls_area_end; // tp points to END of TLS area (variables at negative offsets)
+    for section in elf_file.section_iter() {
+        let name = section.get_name(&elf_file).unwrap_or("");
+        match section {
+            doublejit_vm::frontend::elf::SectionHeader::SectionHeader32(h) => {
+                if name.contains(".tdata") && h.size > 0 {
+                    tdata_size = h.size as usize;
+                    let off = h.offset as usize;
+                    let end = off + tdata_size;
+                    if end <= binary_data.len() { tdata_bytes = binary_data[off..end].to_vec(); }
+                }
+                if name.contains(".tbss") && h.size > 0 {
+                    tbss_size = h.size as usize;
+                }
+            }
+            doublejit_vm::frontend::elf::SectionHeader::SectionHeader64(h) => {
+                if name.contains(".tdata") && h.size > 0 {
+                    tdata_size = h.size as usize;
+                    let off = h.offset as usize;
+                    let end = off + tdata_size;
+                    if end <= binary_data.len() { tdata_bytes = binary_data[off..end].to_vec(); }
+                }
+                if name.contains(".tbss") && h.size > 0 {
+                    tbss_size = h.size as usize;
+                }
+            }
+        }
+    }
 
-    // Initialize TLS area to zeros
-    runtime.load_memory(tls_area_start as u32, &vec![0u8; tls_size as usize])?;
+    // Compute TLS block size and allocate it just below current stack cursor
+    let tls_block_size = (tdata_size + tbss_size + 0xF) & !0xF; // 16-byte align
+    let tls_gap = 256u64; // small gap between stack and TLS
+    let tls_area_start = (current_addr - tls_gap - tls_block_size as u64) & !0xF;
+    let tls_area_end = tls_area_start + tls_block_size as u64;
+    let tp = tls_area_start; // On RISC-V, tp points to start of TLS block (TCB)
+
+    // Initialize TLS: copy .tdata then zero .tbss
+    if tls_block_size > 0 {
+        // Zero the whole block first
+        runtime.load_memory(tls_area_start as u32, &vec![0u8; tls_block_size])?;
+        // Copy .tdata at the beginning
+        if !tdata_bytes.is_empty() {
+            runtime.load_memory(tls_area_start as u32, &tdata_bytes)?;
+        }
+    }
     println!("         • TLS area: 0x{:x} - 0x{:x}", tls_area_start, tls_area_end);
 
     // Update the stack pointer and other registers in the state

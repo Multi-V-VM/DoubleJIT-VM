@@ -218,20 +218,87 @@ impl RiscVRuntime {
             // Provide stub WASI functions to avoid needing full WASI initialization
             // This prevents TLS conflicts with binaries that manage their own TLS
             "wasi_snapshot_preview1" => {
+                // Minimal fd_write that reads a single ciovec from memory and writes to stdout/err
+                // Signature: fd_write(fd: i32, iovs: i32, iovs_len: i32, nwritten: i32) -> i32
                 "fd_write" => Function::new_typed_with_env(
                     &mut store,
                     &env,
-                    |_env: FunctionEnvMut<Arc<Mutex<SyscallEnv>>>, _fd: i32, _iovs: i32, _iovs_len: i32, _nwritten: i32| -> i32 {
-                        // Stub: pretend we wrote data successfully
-                        0 // success
+                    |env: FunctionEnvMut<Arc<Mutex<SyscallEnv>>>, fd: i32, iovs: i32, iovs_len: i32, nwritten: i32| -> i32 {
+                        let memory_opt = {
+                            let syscall_env = env.data().lock().unwrap();
+                            syscall_env.memory.clone()
+                        };
+
+                        if let Some(memory) = memory_opt {
+                            let view = memory.view(&env);
+
+                            // Only support iovs_len >= 1 (we'll aggregate the first one; simple programs use 1)
+                            if iovs_len <= 0 {
+                                // Set nwritten to 0
+                                let _ = view.write(nwritten as u64, &0u32.to_le_bytes());
+                                return 0;
+                            }
+
+                            // ciovec layout on wasm32: [ptr: u32][len: u32]
+                            let mut tmp = [0u8; 4];
+                            if view.read(iovs as u64, &mut tmp).is_err() {
+                                let _ = view.write(nwritten as u64, &0u32.to_le_bytes());
+                                return 0;
+                            }
+                            let buf_ptr = u32::from_le_bytes(tmp) as u64;
+                            if view.read(iovs as u64 + 4, &mut tmp).is_err() {
+                                let _ = view.write(nwritten as u64, &0u32.to_le_bytes());
+                                return 0;
+                            }
+                            let buf_len = u32::from_le_bytes(tmp) as usize;
+
+                            // Read buffer
+                            let mut buffer = vec![0u8; buf_len];
+                            for i in 0..buf_len {
+                                if let Ok(b) = view.read_u8(buf_ptr + i as u64) {
+                                    buffer[i] = b;
+                                } else {
+                                    break;
+                                }
+                            }
+
+                            // Write to host stdout/stderr
+                            use std::io::Write;
+                            eprintln!("DEBUG: WASI fd_write(fd={}, len={})", fd, buffer.len());
+                            let write_res = match fd {
+                                1 => {
+                                    let res = std::io::stdout().write(&buffer);
+                                    let _ = std::io::stdout().flush();
+                                    res
+                                }
+                                2 => {
+                                    let res = std::io::stderr().write(&buffer);
+                                    let _ = std::io::stderr().flush();
+                                    res
+                                }
+                                _ => Ok(buffer.len()),
+                            };
+
+                            let bytes_written = write_res.unwrap_or(0) as u32;
+                            let _ = view.write(nwritten as u64, &bytes_written.to_le_bytes());
+                            0 // success
+                        } else {
+                            // No memory bound; report 0 bytes written
+                            0
+                        }
                     }
                 ),
+                // Minimal fd_read that returns EOF by setting nread=0
+                // Signature: fd_read(fd: i32, iovs: i32, iovs_len: i32, nread: i32) -> i32
                 "fd_read" => Function::new_typed_with_env(
                     &mut store,
                     &env,
-                    |_env: FunctionEnvMut<Arc<Mutex<SyscallEnv>>>, _fd: i32, _iovs: i32, _iovs_len: i32, _nread: i32| -> i32 {
-                        // Stub: pretend we read nothing (EOF)
-                        0 // success
+                    |env: FunctionEnvMut<Arc<Mutex<SyscallEnv>>>, _fd: i32, _iovs: i32, _iovs_len: i32, nread: i32| -> i32 {
+                        if let Some(memory) = env.data().lock().unwrap().memory.clone() {
+                            let view = memory.view(&env);
+                            let _ = view.write(nread as u64, &0u32.to_le_bytes());
+                        }
+                        0 // success (EOF)
                     }
                 ),
                 "proc_exit" => Function::new_typed_with_env(
@@ -510,6 +577,48 @@ impl RiscVRuntime {
                     }
                 }
             }
+            66 => {
+                // writev(fd, iov, iovcnt)
+                let fd = arg1 as i32;
+                let iov_addr = arg2 as u64;
+                let iovcnt = arg3 as usize;
+
+                let memory_opt = {
+                    let syscall_env = env.data().lock().unwrap();
+                    syscall_env.memory.clone()
+                };
+
+                if let Some(memory) = memory_opt {
+                    let view = memory.view(&env);
+                    use std::io::Write;
+
+                    let mut total_written: usize = 0;
+                    for i in 0..iovcnt {
+                        let base_ptr_off = iov_addr + (i as u64) * 16;
+                        let len_off = base_ptr_off + 8;
+
+                        let mut tmp = [0u8; 8];
+                        if view.read(base_ptr_off, &mut tmp).is_err() { break; }
+                        let base_ptr = u64::from_le_bytes(tmp);
+                        if view.read(len_off, &mut tmp).is_err() { break; }
+                        let len = u64::from_le_bytes(tmp) as usize;
+
+                        if len == 0 { continue; }
+                        let mut buffer = vec![0u8; len];
+                        for j in 0..len { if let Ok(b) = view.read_u8(base_ptr + j as u64) { buffer[j] = b; } else { break; } }
+
+                        let res = match fd { 1 => std::io::stdout().write(&buffer), 2 => std::io::stderr().write(&buffer), _ => Ok(len) };
+                        match res { Ok(n) => { total_written += n; }, Err(_) => {} }
+                    }
+
+                    // Flush
+                    let _ = std::io::stdout().flush();
+                    let _ = std::io::stderr().flush();
+                    total_written as i64
+                } else {
+                    0
+                }
+            }
             63 => {
                 // read(fd, buf, count)
                 eprintln!("Warning: read syscall not fully implemented");
@@ -548,12 +657,71 @@ impl RiscVRuntime {
             }
             80 => {
                 // fstat(fd, statbuf)
-                -1 // EBADF
+                let fd = arg1 as i32;
+                let stat_addr = arg2 as u64;
+                eprintln!("DEBUG: fstat(fd={}, stat=0x{:x})", fd, stat_addr);
+
+                let memory = env.data().lock().unwrap().memory.clone();
+                if let Some(memory) = memory {
+                    let view = memory.view(&env);
+
+                    // Minimal struct stat for riscv64 (subset):
+                    // offset 16: st_mode (u32)
+                    // offset 24: st_uid  (u32)
+                    // offset 28: st_gid  (u32)
+                    // offset 48: st_blksize (u64)
+                    // others left zero
+
+                    let mode: u32 = if fd == 0 || fd == 1 || fd == 2 {
+                        // Character device with 0666 perms
+                        0o020666
+                    } else {
+                        // Regular file with 0666 perms
+                        0o100666
+                    };
+
+                    // Zero a reasonable prefix to avoid stale reads (0..=128)
+                    let zero = [0u8; 128];
+                    let _ = view.write(stat_addr, &zero);
+
+                    // Write fields
+                    let _ = view.write(stat_addr + 16, &mode.to_le_bytes());
+                    let _ = view.write(stat_addr + 24, &(1000u32).to_le_bytes()); // uid
+                    let _ = view.write(stat_addr + 28, &(1000u32).to_le_bytes()); // gid
+                    let _ = view.write(stat_addr + 48, &(4096u64).to_le_bytes()); // blksize
+
+                    0 // success
+                } else {
+                    -1 // EFAULT
+                }
             }
             // Note: syscalls 96, 134, 135, 160 are implemented later with proper TLS handling
             169 => {
-                // gettimeofday
-                0 // success (return 0 time)
+                // gettimeofday(tv, tz)
+                let tv_addr = arg1 as u64;
+                let memory = env.data().lock().unwrap().memory.clone();
+                if let Some(memory) = memory { 
+                    let view = memory.view(&env);
+                    // Provide a monotonic-ish fake time
+                    let secs: u64 = 1700000000;
+                    let usec: u64 = 0;
+                    let _ = view.write(tv_addr, &secs.to_le_bytes());
+                    let _ = view.write(tv_addr + 8, &usec.to_le_bytes());
+                    0
+                } else { -1 }
+            }
+            113 | 403 => {
+                // clock_gettime(clockid, timespec*)
+                let ts_addr = arg2 as u64;
+                let memory = env.data().lock().unwrap().memory.clone();
+                if let Some(memory) = memory {
+                    let view = memory.view(&env);
+                    let secs: u64 = 1700000000;
+                    let nsec: u64 = 0;
+                    let _ = view.write(ts_addr, &secs.to_le_bytes());
+                    let _ = view.write(ts_addr + 8, &nsec.to_le_bytes());
+                    0
+                } else { -1 }
             }
             174 => {
                 // getuid
@@ -624,7 +792,8 @@ impl RiscVRuntime {
                 eprintln!("DEBUG: gettid syscall");
                 1000 // Return fixed TID (same as PID for single-threaded)
             }
-            318 => {
+            // getrandom - different numbers on some archs
+            318 | 278 => {
                 // getrandom(buf, buflen, flags)
                 // Critical for libc initialization (stack canaries, ASLR)
                 let buf_addr = arg1 as u64;
@@ -655,7 +824,8 @@ impl RiscVRuntime {
                 eprintln!("DEBUG: arch_prctl syscall: code=0x{:x}, addr=0x{:x}", arg1, arg2);
                 0 // Success (stub - WASM doesn't need TLS setup)
             }
-            334 => {
+            // rseq - different numbers on some archs
+            334 | 293 => {
                 // rseq(rseq, rseq_len, flags, sig) - restartable sequences
                 eprintln!("DEBUG: rseq syscall (stubbed)");
                 0 // Success (stub - not needed in WASM)
