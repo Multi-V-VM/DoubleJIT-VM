@@ -204,7 +204,286 @@ impl WasmModule {
     if
       return
     end
-    ;; In generated code, we use direct global access
+
+    ;; Match on register number and set the corresponding global
+    local.get $reg
+    i32.const 1
+    i32.eq
+    if
+      local.get $val
+      global.set $x1
+      return
+    end
+
+    local.get $reg
+    i32.const 2
+    i32.eq
+    if
+      local.get $val
+      global.set $x2
+      return
+    end
+
+    local.get $reg
+    i32.const 3
+    i32.eq
+    if
+      local.get $val
+      global.set $x3
+      return
+    end
+
+    local.get $reg
+    i32.const 4
+    i32.eq
+    if
+      local.get $val
+      global.set $x4
+      return
+    end
+
+    local.get $reg
+    i32.const 5
+    i32.eq
+    if
+      local.get $val
+      global.set $x5
+      return
+    end
+
+    local.get $reg
+    i32.const 6
+    i32.eq
+    if
+      local.get $val
+      global.set $x6
+      return
+    end
+
+    local.get $reg
+    i32.const 7
+    i32.eq
+    if
+      local.get $val
+      global.set $x7
+      return
+    end
+
+    local.get $reg
+    i32.const 8
+    i32.eq
+    if
+      local.get $val
+      global.set $x8
+      return
+    end
+
+    local.get $reg
+    i32.const 9
+    i32.eq
+    if
+      local.get $val
+      global.set $x9
+      return
+    end
+
+    local.get $reg
+    i32.const 10
+    i32.eq
+    if
+      local.get $val
+      global.set $x10
+      return
+    end
+
+    local.get $reg
+    i32.const 11
+    i32.eq
+    if
+      local.get $val
+      global.set $x11
+      return
+    end
+
+    local.get $reg
+    i32.const 12
+    i32.eq
+    if
+      local.get $val
+      global.set $x12
+      return
+    end
+
+    local.get $reg
+    i32.const 13
+    i32.eq
+    if
+      local.get $val
+      global.set $x13
+      return
+    end
+
+    local.get $reg
+    i32.const 14
+    i32.eq
+    if
+      local.get $val
+      global.set $x14
+      return
+    end
+
+    local.get $reg
+    i32.const 15
+    i32.eq
+    if
+      local.get $val
+      global.set $x15
+      return
+    end
+
+    local.get $reg
+    i32.const 16
+    i32.eq
+    if
+      local.get $val
+      global.set $x16
+      return
+    end
+
+    local.get $reg
+    i32.const 17
+    i32.eq
+    if
+      local.get $val
+      global.set $x17
+      return
+    end
+
+    local.get $reg
+    i32.const 18
+    i32.eq
+    if
+      local.get $val
+      global.set $x18
+      return
+    end
+
+    local.get $reg
+    i32.const 19
+    i32.eq
+    if
+      local.get $val
+      global.set $x19
+      return
+    end
+
+    local.get $reg
+    i32.const 20
+    i32.eq
+    if
+      local.get $val
+      global.set $x20
+      return
+    end
+
+    local.get $reg
+    i32.const 21
+    i32.eq
+    if
+      local.get $val
+      global.set $x21
+      return
+    end
+
+    local.get $reg
+    i32.const 22
+    i32.eq
+    if
+      local.get $val
+      global.set $x22
+      return
+    end
+
+    local.get $reg
+    i32.const 23
+    i32.eq
+    if
+      local.get $val
+      global.set $x23
+      return
+    end
+
+    local.get $reg
+    i32.const 24
+    i32.eq
+    if
+      local.get $val
+      global.set $x24
+      return
+    end
+
+    local.get $reg
+    i32.const 25
+    i32.eq
+    if
+      local.get $val
+      global.set $x25
+      return
+    end
+
+    local.get $reg
+    i32.const 26
+    i32.eq
+    if
+      local.get $val
+      global.set $x26
+      return
+    end
+
+    local.get $reg
+    i32.const 27
+    i32.eq
+    if
+      local.get $val
+      global.set $x27
+      return
+    end
+
+    local.get $reg
+    i32.const 28
+    i32.eq
+    if
+      local.get $val
+      global.set $x28
+      return
+    end
+
+    local.get $reg
+    i32.const 29
+    i32.eq
+    if
+      local.get $val
+      global.set $x29
+      return
+    end
+
+    local.get $reg
+    i32.const 30
+    i32.eq
+    if
+      local.get $val
+      global.set $x30
+      return
+    end
+
+    local.get $reg
+    i32.const 31
+    i32.eq
+    if
+      local.get $val
+      global.set $x31
+      return
+    end
   )
 
   ;; Entry point (will be populated by codegen)

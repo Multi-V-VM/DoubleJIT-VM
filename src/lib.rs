@@ -6,7 +6,7 @@ extern crate alloc;
 #[cfg(any(test, feature = "std"))]
 extern crate std;
 
-mod codegen;
+pub mod codegen;
 pub mod frontend;
 pub mod middleend;
 pub mod backend;

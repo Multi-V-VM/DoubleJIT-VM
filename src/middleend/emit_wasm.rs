@@ -43,15 +43,22 @@ impl WasmEmitter {
     /// Start an infinite loop (for interpreter-style execution)
     pub fn start_loop(&mut self) {
         writeln!(&mut self.wat_code, "    (loop $interpreter_loop").unwrap();
+
+        // CRITICAL: Check exit flag at START of loop (before instructions)
+        // This ensures we can exit even when instructions use br $interpreter_loop
+        writeln!(&mut self.wat_code, "      ;; Check if program should exit").unwrap();
+        writeln!(&mut self.wat_code, "      global.get $exit_flag").unwrap();
+        writeln!(&mut self.wat_code, "      if").unwrap();
+        writeln!(&mut self.wat_code, "        return  ;; Exit function if exit_flag is set").unwrap();
+        writeln!(&mut self.wat_code, "      end").unwrap();
     }
 
     /// End the loop with exit flag check
     pub fn end_loop_with_exit_check(&mut self) {
-        writeln!(&mut self.wat_code, "      ;; Check if program should exit").unwrap();
-        writeln!(&mut self.wat_code, "      global.get $exit_flag").unwrap();
-        writeln!(&mut self.wat_code, "      i32.const 0").unwrap();
-        writeln!(&mut self.wat_code, "      i32.eq").unwrap();
-        writeln!(&mut self.wat_code, "      br_if $interpreter_loop").unwrap();
+        // The exit flag check is now at the START of the loop
+        // This end just unconditionally branches back
+        writeln!(&mut self.wat_code, "      ;; Loop back to check exit flag and execute next instruction").unwrap();
+        writeln!(&mut self.wat_code, "      br $interpreter_loop").unwrap();
         writeln!(&mut self.wat_code, "    )").unwrap(); // Close loop
     }
 
@@ -107,7 +114,7 @@ impl WasmEmitter {
                 RV32Instr::RV32M(rv32m) => self.emit_rv32m(rv32m)?,
                 RV32Instr::RVV(rvv) => self.emit_rvv(rvv)?,
                 _ => {
-                    writeln!(&mut self.wat_code, "    ;; TODO: RV32 instruction {:?}", rv32instr)
+                    writeln!(&mut self.wat_code, "        ;; TODO: RV32 instruction {:?}", rv32instr)
                         .unwrap();
                 }
             },
@@ -116,15 +123,15 @@ impl WasmEmitter {
                 RV64Instr::RV64M(rv64m) => self.emit_rv64m(rv64m)?,
                 RV64Instr::RV64V(rvv) => self.emit_rvv(rvv)?,
                 _ => {
-                    writeln!(&mut self.wat_code, "    ;; TODO: RV64 instruction {:?}", rv64instr)
+                    writeln!(&mut self.wat_code, "        ;; TODO: RV64 instruction {:?}", rv64instr)
                         .unwrap();
                 }
             },
             Instr::NOP => {
-                writeln!(&mut self.wat_code, "    ;; NOP").unwrap();
+                writeln!(&mut self.wat_code, "        ;; NOP").unwrap();
             }
             _ => {
-                writeln!(&mut self.wat_code, "    ;; TODO: instruction {:?}", instr.instr)
+                writeln!(&mut self.wat_code, "        ;; TODO: instruction {:?}", instr.instr)
                     .unwrap();
             }
         }
@@ -138,6 +145,10 @@ impl WasmEmitter {
             )
             .unwrap();
         }
+
+        // CRITICAL FIX: Immediately branch back to loop start after executing this instruction
+        // This prevents checking all remaining instructions unnecessarily
+        writeln!(&mut self.wat_code, "        br $interpreter_loop").unwrap();
 
         // Close the if block
         writeln!(&mut self.wat_code, "      end").unwrap();
@@ -157,7 +168,7 @@ impl WasmEmitter {
                 let imm_val = imm.decode() as i32;
                 writeln!(
                     &mut self.wat_code,
-                    "    i64.const {}\n    global.set $x{}",
+                    "        i64.const {}\n        global.set $x{}",
                     (imm_val << 12) as i64,
                     rd_num
                 )
@@ -166,15 +177,24 @@ impl WasmEmitter {
 
             AUIPC(Rd(rd), imm) => {
                 // rd = pc + (imm << 12)
+                // CRITICAL: PC must be the address of THIS instruction when it executes
                 let rd_num = self.reg_num(rd)?;
                 let imm_val = imm.decode() as i32;
                 writeln!(
                     &mut self.wat_code,
-                    "    global.get $pc\n    i64.const {}\n    i64.add\n    global.set $x{}",
-                    (imm_val << 12) as i64,
-                    rd_num
+                    "        global.get $pc\n        i64.const {}\n        i64.add\n        global.set $x{}",
+                    (imm_val << 12) as i64, rd_num
                 )
                 .unwrap();
+
+                // For debugging _start, log AUIPC to x10 (a0) which loads main's address
+                if rd_num == 10 {
+                    writeln!(
+                        &mut self.wat_code,
+                        "        ;; DEBUG AUIPC a0: PC + offset\n        global.get $x10\n        i32.wrap_i64\n        call $debug_print"
+                    )
+                    .unwrap();
+                }
             }
 
             JAL(Rd(rd), imm) => {
@@ -188,14 +208,14 @@ impl WasmEmitter {
                     // x0 is always zero - don't save return address
                     writeln!(
                         &mut self.wat_code,
-                        "    ;; Jump (no return address saved to x0)\n    global.get $pc\n    i64.const {}\n    i64.add\n    global.set $pc",
+                        "        ;; Jump (no return address saved to x0)\n        global.get $pc\n        i64.const {}\n        i64.add\n        global.set $pc",
                         imm_val as i64
                     )
                     .unwrap();
                 } else {
                     writeln!(
                         &mut self.wat_code,
-                        "    ;; Save return address\n    global.get $pc\n    i64.const 4\n    i64.add\n    global.set $x{}\n    ;; Jump\n    global.get $pc\n    i64.const {}\n    i64.add\n    global.set $pc",
+                        "        ;; Save return address\n        global.get $pc\n        i64.const 4\n        i64.add\n        global.set $x{}\n        ;; Jump\n        global.get $pc\n        i64.const {}\n        i64.add\n        global.set $pc",
                         rd_num, imm_val as i64
                     )
                     .unwrap();
@@ -213,14 +233,14 @@ impl WasmEmitter {
                     // x0 is always zero - don't save return address
                     writeln!(
                         &mut self.wat_code,
-                        "    ;; Compute target (no return address saved to x0)\n    global.get $x{}\n    i64.const {}\n    i64.add\n    i64.const -2\n    i64.and\n    global.set $pc",
+                        "        ;; Compute target (no return address saved to x0)\n        global.get $x{}\n        i64.const {}\n        i64.add\n        i64.const -2\n        i64.and\n        global.set $pc",
                         rs1_num, imm_val as i64
                     )
                     .unwrap();
                 } else {
                     writeln!(
                         &mut self.wat_code,
-                        "    ;; Save return address\n    global.get $pc\n    i64.const 4\n    i64.add\n    global.set $x{}\n    ;; Compute target\n    global.get $x{}\n    i64.const {}\n    i64.add\n    i64.const -2\n    i64.and\n    global.set $pc",
+                        "        ;; Save return address\n        global.get $pc\n        i64.const 4\n        i64.add\n        global.set $x{}\n        ;; Compute target\n        global.get $x{}\n        i64.const {}\n        i64.add\n        i64.const -2\n        i64.and\n        global.set $pc",
                         rd_num, rs1_num, imm_val as i64
                     )
                     .unwrap();
@@ -234,7 +254,7 @@ impl WasmEmitter {
                 let imm_val = imm.0 as i32;
                 writeln!(
                     &mut self.wat_code,
-                    "    global.get $x{}\n    global.get $x{}\n    i64.eq\n    if\n      global.get $pc\n      i64.const {}\n      i64.add\n      global.set $pc\n    else\n      global.get $pc\n      i64.const 4\n      i64.add\n      global.set $pc\n    end",
+                    "        global.get $x{}\n        global.get $x{}\n        i64.eq\n        if\n          global.get $pc\n          i64.const {}\n          i64.add\n          global.set $pc\n        else\n          global.get $pc\n          i64.const 4\n          i64.add\n          global.set $pc\n        end",
                     rs1_num, rs2_num, imm_val as i64
                 )
                 .unwrap();
@@ -246,7 +266,7 @@ impl WasmEmitter {
                 let imm_val = imm.0 as i32;
                 writeln!(
                     &mut self.wat_code,
-                    "    global.get $x{}\n    global.get $x{}\n    i64.ne\n    if\n      global.get $pc\n      i64.const {}\n      i64.add\n      global.set $pc\n    else\n      global.get $pc\n      i64.const 4\n      i64.add\n      global.set $pc\n    end",
+                    "        global.get $x{}\n        global.get $x{}\n        i64.ne\n        if\n          global.get $pc\n          i64.const {}\n          i64.add\n          global.set $pc\n        else\n          global.get $pc\n          i64.const 4\n          i64.add\n          global.set $pc\n        end",
                     rs1_num, rs2_num, imm_val as i64
                 )
                 .unwrap();
@@ -258,7 +278,7 @@ impl WasmEmitter {
                 let imm_val = imm.0 as i32;
                 writeln!(
                     &mut self.wat_code,
-                    "    global.get $x{}\n    global.get $x{}\n    i64.lt_s\n    if\n      global.get $pc\n      i64.const {}\n      i64.add\n      global.set $pc\n    else\n      global.get $pc\n      i64.const 4\n      i64.add\n      global.set $pc\n    end",
+                    "        global.get $x{}\n        global.get $x{}\n        i64.lt_s\n        if\n          global.get $pc\n          i64.const {}\n          i64.add\n          global.set $pc\n        else\n          global.get $pc\n          i64.const 4\n          i64.add\n          global.set $pc\n        end",
                     rs1_num, rs2_num, imm_val as i64
                 )
                 .unwrap();
@@ -270,7 +290,7 @@ impl WasmEmitter {
                 let imm_val = imm.0 as i32;
                 writeln!(
                     &mut self.wat_code,
-                    "    global.get $x{}\n    global.get $x{}\n    i64.ge_s\n    if\n      global.get $pc\n      i64.const {}\n      i64.add\n      global.set $pc\n    else\n      global.get $pc\n      i64.const 4\n      i64.add\n      global.set $pc\n    end",
+                    "        global.get $x{}\n        global.get $x{}\n        i64.ge_s\n        if\n          global.get $pc\n          i64.const {}\n          i64.add\n          global.set $pc\n        else\n          global.get $pc\n          i64.const 4\n          i64.add\n          global.set $pc\n        end",
                     rs1_num, rs2_num, imm_val as i64
                 )
                 .unwrap();
@@ -282,7 +302,7 @@ impl WasmEmitter {
                 let imm_val = imm.0 as i32;
                 writeln!(
                     &mut self.wat_code,
-                    "    global.get $x{}\n    global.get $x{}\n    i64.lt_u\n    if\n      global.get $pc\n      i64.const {}\n      i64.add\n      global.set $pc\n    else\n      global.get $pc\n      i64.const 4\n      i64.add\n      global.set $pc\n    end",
+                    "        global.get $x{}\n        global.get $x{}\n        i64.lt_u\n        if\n          global.get $pc\n          i64.const {}\n          i64.add\n          global.set $pc\n        else\n          global.get $pc\n          i64.const 4\n          i64.add\n          global.set $pc\n        end",
                     rs1_num, rs2_num, imm_val as i64
                 )
                 .unwrap();
@@ -294,7 +314,7 @@ impl WasmEmitter {
                 let imm_val = imm.0 as i32;
                 writeln!(
                     &mut self.wat_code,
-                    "    global.get $x{}\n    global.get $x{}\n    i64.ge_u\n    if\n      global.get $pc\n      i64.const {}\n      i64.add\n      global.set $pc\n    else\n      global.get $pc\n      i64.const 4\n      i64.add\n      global.set $pc\n    end",
+                    "        global.get $x{}\n        global.get $x{}\n        i64.ge_u\n        if\n          global.get $pc\n          i64.const {}\n          i64.add\n          global.set $pc\n        else\n          global.get $pc\n          i64.const 4\n          i64.add\n          global.set $pc\n        end",
                     rs1_num, rs2_num, imm_val as i64
                 )
                 .unwrap();
@@ -306,7 +326,7 @@ impl WasmEmitter {
                 let imm_val = imm.decode() as i32;
                 writeln!(
                     &mut self.wat_code,
-                    "    global.get $x{}\n    i64.const {}\n    i64.add\n    call $vaddr_to_offset\n    i32.load8_s\n    i64.extend_i32_s\n    global.set $x{}",
+                    "        global.get $x{}\n        i64.const {}\n        i64.add\n        call $vaddr_to_offset\n        i32.load8_s\n        i64.extend_i32_s\n        global.set $x{}",
                     rs1_num, imm_val as i64, rd_num
                 )
                 .unwrap();
@@ -318,7 +338,7 @@ impl WasmEmitter {
                 let imm_val = imm.decode() as i32;
                 writeln!(
                     &mut self.wat_code,
-                    "    global.get $x{}\n    i64.const {}\n    i64.add\n    call $vaddr_to_offset\n    i32.load16_s\n    i64.extend_i32_s\n    global.set $x{}",
+                    "        global.get $x{}\n        i64.const {}\n        i64.add\n        call $vaddr_to_offset\n        i32.load16_s\n        i64.extend_i32_s\n        global.set $x{}",
                     rs1_num, imm_val as i64, rd_num
                 )
                 .unwrap();
@@ -330,7 +350,7 @@ impl WasmEmitter {
                 let imm_val = imm.decode() as i32;
                 writeln!(
                     &mut self.wat_code,
-                    "    global.get $x{}\n    i64.const {}\n    i64.add\n    call $vaddr_to_offset\n    i32.load\n    i64.extend_i32_s\n    global.set $x{}",
+                    "        global.get $x{}\n        i64.const {}\n        i64.add\n        call $vaddr_to_offset\n        i32.load\n        i64.extend_i32_s\n        global.set $x{}",
                     rs1_num, imm_val as i64, rd_num
                 )
                 .unwrap();
@@ -342,7 +362,7 @@ impl WasmEmitter {
                 let imm_val = imm.decode() as i32;
                 writeln!(
                     &mut self.wat_code,
-                    "    global.get $x{}\n    i64.const {}\n    i64.add\n    call $vaddr_to_offset\n    i32.load8_u\n    i64.extend_i32_u\n    global.set $x{}",
+                    "        global.get $x{}\n        i64.const {}\n        i64.add\n        call $vaddr_to_offset\n        i32.load8_u\n        i64.extend_i32_u\n        global.set $x{}",
                     rs1_num, imm_val as i64, rd_num
                 )
                 .unwrap();
@@ -354,7 +374,7 @@ impl WasmEmitter {
                 let imm_val = imm.decode() as i32;
                 writeln!(
                     &mut self.wat_code,
-                    "    global.get $x{}\n    i64.const {}\n    i64.add\n    call $vaddr_to_offset\n    i32.load16_u\n    i64.extend_i32_u\n    global.set $x{}",
+                    "        global.get $x{}\n        i64.const {}\n        i64.add\n        call $vaddr_to_offset\n        i32.load16_u\n        i64.extend_i32_u\n        global.set $x{}",
                     rs1_num, imm_val as i64, rd_num
                 )
                 .unwrap();
@@ -366,7 +386,7 @@ impl WasmEmitter {
                 let imm_val = imm.decode() as i32;
                 writeln!(
                     &mut self.wat_code,
-                    "    global.get $x{}\n    i64.const {}\n    i64.add\n    call $vaddr_to_offset\n    global.get $x{}\n    i32.wrap_i64\n    i32.store8",
+                    "        global.get $x{}\n        i64.const {}\n        i64.add\n        call $vaddr_to_offset\n        global.get $x{}\n        i32.wrap_i64\n        i32.store8",
                     rs1_num, imm_val as i64, rs2_num
                 )
                 .unwrap();
@@ -378,7 +398,7 @@ impl WasmEmitter {
                 let imm_val = imm.decode() as i32;
                 writeln!(
                     &mut self.wat_code,
-                    "    global.get $x{}\n    i64.const {}\n    i64.add\n    call $vaddr_to_offset\n    global.get $x{}\n    i32.wrap_i64\n    i32.store16",
+                    "        global.get $x{}\n        i64.const {}\n        i64.add\n        call $vaddr_to_offset\n        global.get $x{}\n        i32.wrap_i64\n        i32.store16",
                     rs1_num, imm_val as i64, rs2_num
                 )
                 .unwrap();
@@ -390,7 +410,7 @@ impl WasmEmitter {
                 let imm_val = imm.decode() as i32;
                 writeln!(
                     &mut self.wat_code,
-                    "    global.get $x{}\n    i64.const {}\n    i64.add\n    call $vaddr_to_offset\n    global.get $x{}\n    i32.wrap_i64\n    i32.store",
+                    "        global.get $x{}\n        i64.const {}\n        i64.add\n        call $vaddr_to_offset\n        global.get $x{}\n        i32.wrap_i64\n        i32.store",
                     rs1_num, imm_val as i64, rs2_num
                 )
                 .unwrap();
@@ -402,10 +422,19 @@ impl WasmEmitter {
                 let imm_val = imm.decode() as i32;
                 writeln!(
                     &mut self.wat_code,
-                    "    global.get $x{}\n    i64.const {}\n    i64.add\n    global.set $x{}",
+                    "        global.get $x{}\n        i64.const {}\n        i64.add\n        global.set $x{}",
                     rs1_num, imm_val as i64, rd_num
                 )
                 .unwrap();
+
+                // Debug: Print a0 after ADDI if it's calculating main address (immediate = -104)
+                if rd_num == 10 && imm_val == -104 {
+                    writeln!(
+                        &mut self.wat_code,
+                        "        ;; DEBUG: a0 after ADDI -104 (should be main address = 0x1059c)\n        global.get $x10\n        i32.wrap_i64\n        call $debug_print"
+                    )
+                    .unwrap();
+                }
             }
 
             SLTI(Rd(rd), Rs1(rs1), imm) => {
@@ -414,7 +443,7 @@ impl WasmEmitter {
                 let imm_val = imm.decode() as i32;
                 writeln!(
                     &mut self.wat_code,
-                    "    global.get $x{}\n    i64.const {}\n    i64.lt_s\n    i64.extend_i32_u\n    global.set $x{}",
+                    "        global.get $x{}\n        i64.const {}\n        i64.lt_s\n        i64.extend_i32_u\n        global.set $x{}",
                     rs1_num, imm_val as i64, rd_num
                 )
                 .unwrap();
@@ -426,7 +455,7 @@ impl WasmEmitter {
                 let imm_val = imm.decode() as u32;
                 writeln!(
                     &mut self.wat_code,
-                    "    global.get $x{}\n    i64.const {}\n    i64.lt_u\n    i64.extend_i32_u\n    global.set $x{}",
+                    "        global.get $x{}\n        i64.const {}\n        i64.lt_u\n        i64.extend_i32_u\n        global.set $x{}",
                     rs1_num, imm_val as i64, rd_num
                 )
                 .unwrap();
@@ -438,7 +467,7 @@ impl WasmEmitter {
                 let imm_val = imm.decode() as i32;
                 writeln!(
                     &mut self.wat_code,
-                    "    global.get $x{}\n    i64.const {}\n    i64.xor\n    global.set $x{}",
+                    "        global.get $x{}\n        i64.const {}\n        i64.xor\n        global.set $x{}",
                     rs1_num, imm_val as i64, rd_num
                 )
                 .unwrap();
@@ -450,7 +479,7 @@ impl WasmEmitter {
                 let imm_val = imm.decode() as i32;
                 writeln!(
                     &mut self.wat_code,
-                    "    global.get $x{}\n    i64.const {}\n    i64.or\n    global.set $x{}",
+                    "        global.get $x{}\n        i64.const {}\n        i64.or\n        global.set $x{}",
                     rs1_num, imm_val as i64, rd_num
                 )
                 .unwrap();
@@ -462,7 +491,7 @@ impl WasmEmitter {
                 let imm_val = imm.decode() as i32;
                 writeln!(
                     &mut self.wat_code,
-                    "    global.get $x{}\n    i64.const {}\n    i64.and\n    global.set $x{}",
+                    "        global.get $x{}\n        i64.const {}\n        i64.and\n        global.set $x{}",
                     rs1_num, imm_val as i64, rd_num
                 )
                 .unwrap();
@@ -473,7 +502,7 @@ impl WasmEmitter {
                 let rs1_num = self.reg_num(rs1)?;
                 writeln!(
                     &mut self.wat_code,
-                    "    global.get $x{}\n    i64.const {}\n    i64.shl\n    global.set $x{}",
+                    "        global.get $x{}\n        i64.const {}\n        i64.shl\n        global.set $x{}",
                     rs1_num, shamt.0, rd_num
                 )
                 .unwrap();
@@ -484,7 +513,7 @@ impl WasmEmitter {
                 let rs1_num = self.reg_num(rs1)?;
                 writeln!(
                     &mut self.wat_code,
-                    "    global.get $x{}\n    i64.const {}\n    i64.shr_u\n    global.set $x{}",
+                    "        global.get $x{}\n        i64.const {}\n        i64.shr_u\n        global.set $x{}",
                     rs1_num, shamt.0, rd_num
                 )
                 .unwrap();
@@ -495,7 +524,7 @@ impl WasmEmitter {
                 let rs1_num = self.reg_num(rs1)?;
                 writeln!(
                     &mut self.wat_code,
-                    "    global.get $x{}\n    i64.const {}\n    i64.shr_s\n    global.set $x{}",
+                    "        global.get $x{}\n        i64.const {}\n        i64.shr_s\n        global.set $x{}",
                     rs1_num, shamt.0, rd_num
                 )
                 .unwrap();
@@ -507,7 +536,7 @@ impl WasmEmitter {
                 let rs2_num = self.reg_num(rs2)?;
                 writeln!(
                     &mut self.wat_code,
-                    "    global.get $x{}\n    global.get $x{}\n    i64.add\n    global.set $x{}",
+                    "        global.get $x{}\n        global.get $x{}\n        i64.add\n        global.set $x{}",
                     rs1_num, rs2_num, rd_num
                 )
                 .unwrap();
@@ -519,7 +548,7 @@ impl WasmEmitter {
                 let rs2_num = self.reg_num(rs2)?;
                 writeln!(
                     &mut self.wat_code,
-                    "    global.get $x{}\n    global.get $x{}\n    i64.sub\n    global.set $x{}",
+                    "        global.get $x{}\n        global.get $x{}\n        i64.sub\n        global.set $x{}",
                     rs1_num, rs2_num, rd_num
                 )
                 .unwrap();
@@ -531,7 +560,7 @@ impl WasmEmitter {
                 let rs2_num = self.reg_num(rs2)?;
                 writeln!(
                     &mut self.wat_code,
-                    "    global.get $x{}\n    global.get $x{}\n    i64.const 31\n    i64.and\n    i64.shl\n    global.set $x{}",
+                    "        global.get $x{}\n        global.get $x{}\n        i64.const 31\n        i64.and\n        i64.shl\n        global.set $x{}",
                     rs1_num, rs2_num, rd_num
                 )
                 .unwrap();
@@ -543,7 +572,7 @@ impl WasmEmitter {
                 let rs2_num = self.reg_num(rs2)?;
                 writeln!(
                     &mut self.wat_code,
-                    "    global.get $x{}\n    global.get $x{}\n    i64.lt_s\n    i64.extend_i32_u\n    global.set $x{}",
+                    "        global.get $x{}\n        global.get $x{}\n        i64.lt_s\n        i64.extend_i32_u\n        global.set $x{}",
                     rs1_num, rs2_num, rd_num
                 )
                 .unwrap();
@@ -555,7 +584,7 @@ impl WasmEmitter {
                 let rs2_num = self.reg_num(rs2)?;
                 writeln!(
                     &mut self.wat_code,
-                    "    global.get $x{}\n    global.get $x{}\n    i64.lt_u\n    i64.extend_i32_u\n    global.set $x{}",
+                    "        global.get $x{}\n        global.get $x{}\n        i64.lt_u\n        i64.extend_i32_u\n        global.set $x{}",
                     rs1_num, rs2_num, rd_num
                 )
                 .unwrap();
@@ -567,7 +596,7 @@ impl WasmEmitter {
                 let rs2_num = self.reg_num(rs2)?;
                 writeln!(
                     &mut self.wat_code,
-                    "    global.get $x{}\n    global.get $x{}\n    i64.xor\n    global.set $x{}",
+                    "        global.get $x{}\n        global.get $x{}\n        i64.xor\n        global.set $x{}",
                     rs1_num, rs2_num, rd_num
                 )
                 .unwrap();
@@ -579,7 +608,7 @@ impl WasmEmitter {
                 let rs2_num = self.reg_num(rs2)?;
                 writeln!(
                     &mut self.wat_code,
-                    "    global.get $x{}\n    global.get $x{}\n    i64.const 31\n    i64.and\n    i64.shr_u\n    global.set $x{}",
+                    "        global.get $x{}\n        global.get $x{}\n        i64.const 31\n        i64.and\n        i64.shr_u\n        global.set $x{}",
                     rs1_num, rs2_num, rd_num
                 )
                 .unwrap();
@@ -591,7 +620,7 @@ impl WasmEmitter {
                 let rs2_num = self.reg_num(rs2)?;
                 writeln!(
                     &mut self.wat_code,
-                    "    global.get $x{}\n    global.get $x{}\n    i64.const 31\n    i64.and\n    i64.shr_s\n    global.set $x{}",
+                    "        global.get $x{}\n        global.get $x{}\n        i64.const 31\n        i64.and\n        i64.shr_s\n        global.set $x{}",
                     rs1_num, rs2_num, rd_num
                 )
                 .unwrap();
@@ -603,7 +632,7 @@ impl WasmEmitter {
                 let rs2_num = self.reg_num(rs2)?;
                 writeln!(
                     &mut self.wat_code,
-                    "    global.get $x{}\n    global.get $x{}\n    i64.or\n    global.set $x{}",
+                    "        global.get $x{}\n        global.get $x{}\n        i64.or\n        global.set $x{}",
                     rs1_num, rs2_num, rd_num
                 )
                 .unwrap();
@@ -615,22 +644,22 @@ impl WasmEmitter {
                 let rs2_num = self.reg_num(rs2)?;
                 writeln!(
                     &mut self.wat_code,
-                    "    global.get $x{}\n    global.get $x{}\n    i64.and\n    global.set $x{}",
+                    "        global.get $x{}\n        global.get $x{}\n        i64.and\n        global.set $x{}",
                     rs1_num, rs2_num, rd_num
                 )
                 .unwrap();
             }
 
             FENCE(_, _, _, _, _) => {
-                writeln!(&mut self.wat_code, "    ;; FENCE (no-op in WASM)").unwrap();
+                writeln!(&mut self.wat_code, "        ;; FENCE (no-op in WASM)").unwrap();
             }
 
             FENCE_TSO => {
-                writeln!(&mut self.wat_code, "    ;; FENCE.TSO (no-op in WASM)").unwrap();
+                writeln!(&mut self.wat_code, "        ;; FENCE.TSO (no-op in WASM)").unwrap();
             }
 
             PAUSE => {
-                writeln!(&mut self.wat_code, "    ;; PAUSE (no-op in WASM)").unwrap();
+                writeln!(&mut self.wat_code, "        ;; PAUSE (no-op in WASM)").unwrap();
             }
 
             ECALL => {
@@ -642,38 +671,16 @@ impl WasmEmitter {
                 // Generate a switch on syscall number to call WASI functions directly
                 writeln!(
                     &mut self.wat_code,
-                    "    ;; ECALL - translate RISC-V syscall to WASI/stub call
-    global.get $x17
-    i64.const 64
-    i64.eq
-    if
-      ;; write(fd, buf, count) -> fd_write
-      global.get $x10  ;; fd
-      global.get $x11  ;; buf
-      global.get $x12  ;; count
-      call $wasi_write
-      global.set $x10
-    else
-      global.get $x17
-      i64.const 93
-      i64.eq
-      if
-        ;; exit(status) -> proc_exit
-        global.get $x10
-        i32.wrap_i64
-        call $wasi_proc_exit
-        i64.const 0
-        global.set $x10
-      else
+                    "        ;; ECALL - translate RISC-V syscall to handler
         global.get $x17
-        i64.const 94
+        i64.const 64
         i64.eq
         if
-          ;; exit_group(status) -> proc_exit
-          global.get $x10
-          i32.wrap_i64
-          call $wasi_proc_exit
-          i64.const 0
+          ;; write(fd, buf, count) -> fd_write
+          global.get $x10  ;; fd
+          global.get $x11  ;; buf
+          global.get $x12  ;; count
+          call $wasi_write
           global.set $x10
         else
           global.get $x17
@@ -700,7 +707,7 @@ impl WasmEmitter {
                 i64.const 0
                 global.set $x10
               else
-                ;; Fallback to syscall handler for other syscalls
+                ;; All other syscalls (including exit/93 and exit_group/94) go through syscall handler
                 global.get $x17
                 global.get $x10
                 global.get $x11
@@ -713,15 +720,13 @@ impl WasmEmitter {
               end
             end
           end
-        end
-      end
-    end"
+        end"
                 )
                 .unwrap();
             }
 
             EBREAK => {
-                writeln!(&mut self.wat_code, "    ;; EBREAK (debug trap)").unwrap();
+                writeln!(&mut self.wat_code, "        ;; EBREAK (debug trap)").unwrap();
             }
         }
 
@@ -739,7 +744,7 @@ impl WasmEmitter {
                 let imm_val = imm.decode() as i32;
                 writeln!(
                     &mut self.wat_code,
-                    "    global.get $x{}\n    i64.const {}\n    i64.add\n    call $vaddr_to_offset\n    i32.load\n    i64.extend_i32_u\n    global.set $x{}",
+                    "        global.get $x{}\n        i64.const {}\n        i64.add\n        call $vaddr_to_offset\n        i32.load\n        i64.extend_i32_u\n        global.set $x{}",
                     rs1_num, imm_val as i64, rd_num
                 )
                 .unwrap();
@@ -751,7 +756,7 @@ impl WasmEmitter {
                 let imm_val = imm.decode() as i32;
                 writeln!(
                     &mut self.wat_code,
-                    "    global.get $x{}\n    i64.const {}\n    i64.add\n    call $vaddr_to_offset\n    i64.load\n    global.set $x{}",
+                    "        global.get $x{}\n        i64.const {}\n        i64.add\n        call $vaddr_to_offset\n        i64.load\n        global.set $x{}",
                     rs1_num, imm_val as i64, rd_num
                 )
                 .unwrap();
@@ -763,7 +768,7 @@ impl WasmEmitter {
                 let imm_val = imm.decode() as i32;
                 writeln!(
                     &mut self.wat_code,
-                    "    global.get $x{}\n    i64.const {}\n    i64.add\n    call $vaddr_to_offset\n    global.get $x{}\n    i64.store",
+                    "        global.get $x{}\n        i64.const {}\n        i64.add\n        call $vaddr_to_offset\n        global.get $x{}\n        i64.store",
                     rs1_num, imm_val as i64, rs2_num
                 )
                 .unwrap();
@@ -774,7 +779,7 @@ impl WasmEmitter {
                 let rs1_num = self.reg_num(rs1)?;
                 writeln!(
                     &mut self.wat_code,
-                    "    global.get $x{}\n    i64.const {}\n    i64.shl\n    global.set $x{}",
+                    "        global.get $x{}\n        i64.const {}\n        i64.shl\n        global.set $x{}",
                     rs1_num, shamt.0, rd_num
                 )
                 .unwrap();
@@ -785,7 +790,7 @@ impl WasmEmitter {
                 let rs1_num = self.reg_num(rs1)?;
                 writeln!(
                     &mut self.wat_code,
-                    "    global.get $x{}\n    i64.const {}\n    i64.shr_u\n    global.set $x{}",
+                    "        global.get $x{}\n        i64.const {}\n        i64.shr_u\n        global.set $x{}",
                     rs1_num, shamt.0, rd_num
                 )
                 .unwrap();
@@ -796,7 +801,7 @@ impl WasmEmitter {
                 let rs1_num = self.reg_num(rs1)?;
                 writeln!(
                     &mut self.wat_code,
-                    "    global.get $x{}\n    i64.const {}\n    i64.shr_s\n    global.set $x{}",
+                    "        global.get $x{}\n        i64.const {}\n        i64.shr_s\n        global.set $x{}",
                     rs1_num, shamt.0, rd_num
                 )
                 .unwrap();
@@ -808,7 +813,7 @@ impl WasmEmitter {
                 let imm_val = imm.decode() as i32;
                 writeln!(
                     &mut self.wat_code,
-                    "    global.get $x{}\n    i32.wrap_i64\n    i32.const {}\n    i32.add\n    i64.extend_i32_s\n    global.set $x{}",
+                    "        global.get $x{}\n        i32.wrap_i64\n        i32.const {}\n        i32.add\n        i64.extend_i32_s\n        global.set $x{}",
                     rs1_num, imm_val, rd_num
                 )
                 .unwrap();
@@ -819,7 +824,7 @@ impl WasmEmitter {
                 let rs1_num = self.reg_num(rs1)?;
                 writeln!(
                     &mut self.wat_code,
-                    "    global.get $x{}\n    i32.wrap_i64\n    i32.const {}\n    i32.shl\n    i64.extend_i32_s\n    global.set $x{}",
+                    "        global.get $x{}\n        i32.wrap_i64\n        i32.const {}\n        i32.shl\n        i64.extend_i32_s\n        global.set $x{}",
                     rs1_num, shamt.0, rd_num
                 )
                 .unwrap();
@@ -830,7 +835,7 @@ impl WasmEmitter {
                 let rs1_num = self.reg_num(rs1)?;
                 writeln!(
                     &mut self.wat_code,
-                    "    global.get $x{}\n    i32.wrap_i64\n    i32.const {}\n    i32.shr_u\n    i64.extend_i32_s\n    global.set $x{}",
+                    "        global.get $x{}\n        i32.wrap_i64\n        i32.const {}\n        i32.shr_u\n        i64.extend_i32_s\n        global.set $x{}",
                     rs1_num, shamt.0, rd_num
                 )
                 .unwrap();
@@ -841,7 +846,7 @@ impl WasmEmitter {
                 let rs1_num = self.reg_num(rs1)?;
                 writeln!(
                     &mut self.wat_code,
-                    "    global.get $x{}\n    i32.wrap_i64\n    i32.const {}\n    i32.shr_s\n    i64.extend_i32_s\n    global.set $x{}",
+                    "        global.get $x{}\n        i32.wrap_i64\n        i32.const {}\n        i32.shr_s\n        i64.extend_i32_s\n        global.set $x{}",
                     rs1_num, shamt.0, rd_num
                 )
                 .unwrap();
@@ -853,7 +858,7 @@ impl WasmEmitter {
                 let rs2_num = self.reg_num(rs2)?;
                 writeln!(
                     &mut self.wat_code,
-                    "    global.get $x{}\n    i32.wrap_i64\n    global.get $x{}\n    i32.wrap_i64\n    i32.add\n    i64.extend_i32_s\n    global.set $x{}",
+                    "        global.get $x{}\n        i32.wrap_i64\n        global.get $x{}\n        i32.wrap_i64\n        i32.add\n        i64.extend_i32_s\n        global.set $x{}",
                     rs1_num, rs2_num, rd_num
                 )
                 .unwrap();
@@ -865,7 +870,7 @@ impl WasmEmitter {
                 let rs2_num = self.reg_num(rs2)?;
                 writeln!(
                     &mut self.wat_code,
-                    "    global.get $x{}\n    i32.wrap_i64\n    global.get $x{}\n    i32.wrap_i64\n    i32.sub\n    i64.extend_i32_s\n    global.set $x{}",
+                    "        global.get $x{}\n        i32.wrap_i64\n        global.get $x{}\n        i32.wrap_i64\n        i32.sub\n        i64.extend_i32_s\n        global.set $x{}",
                     rs1_num, rs2_num, rd_num
                 )
                 .unwrap();
@@ -877,7 +882,7 @@ impl WasmEmitter {
                 let rs2_num = self.reg_num(rs2)?;
                 writeln!(
                     &mut self.wat_code,
-                    "    global.get $x{}\n    i32.wrap_i64\n    global.get $x{}\n    i32.wrap_i64\n    i32.const 31\n    i32.and\n    i32.shl\n    i64.extend_i32_s\n    global.set $x{}",
+                    "        global.get $x{}\n        i32.wrap_i64\n        global.get $x{}\n        i32.wrap_i64\n        i32.const 31\n        i32.and\n        i32.shl\n        i64.extend_i32_s\n        global.set $x{}",
                     rs1_num, rs2_num, rd_num
                 )
                 .unwrap();
@@ -889,7 +894,7 @@ impl WasmEmitter {
                 let rs2_num = self.reg_num(rs2)?;
                 writeln!(
                     &mut self.wat_code,
-                    "    global.get $x{}\n    i32.wrap_i64\n    global.get $x{}\n    i32.wrap_i64\n    i32.const 31\n    i32.and\n    i32.shr_u\n    i64.extend_i32_s\n    global.set $x{}",
+                    "        global.get $x{}\n        i32.wrap_i64\n        global.get $x{}\n        i32.wrap_i64\n        i32.const 31\n        i32.and\n        i32.shr_u\n        i64.extend_i32_s\n        global.set $x{}",
                     rs1_num, rs2_num, rd_num
                 )
                 .unwrap();
@@ -901,7 +906,7 @@ impl WasmEmitter {
                 let rs2_num = self.reg_num(rs2)?;
                 writeln!(
                     &mut self.wat_code,
-                    "    global.get $x{}\n    i32.wrap_i64\n    global.get $x{}\n    i32.wrap_i64\n    i32.const 31\n    i32.and\n    i32.shr_s\n    i64.extend_i32_s\n    global.set $x{}",
+                    "        global.get $x{}\n        i32.wrap_i64\n        global.get $x{}\n        i32.wrap_i64\n        i32.const 31\n        i32.and\n        i32.shr_s\n        i64.extend_i32_s\n        global.set $x{}",
                     rs1_num, rs2_num, rd_num
                 )
                 .unwrap();
@@ -922,7 +927,7 @@ impl WasmEmitter {
                 let rs2_num = self.reg_num(rs2)?;
                 writeln!(
                     &mut self.wat_code,
-                    "    global.get $x{}\n    global.get $x{}\n    i64.mul\n    global.set $x{}",
+                    "        global.get $x{}\n        global.get $x{}\n        i64.mul\n        global.set $x{}",
                     rs1_num, rs2_num, rd_num
                 )
                 .unwrap();
@@ -934,7 +939,7 @@ impl WasmEmitter {
                 let rs2_num = self.reg_num(rs2)?;
                 writeln!(
                     &mut self.wat_code,
-                    "    ;; MULH - high part of signed multiplication\n    ;; TODO: implement 128-bit multiplication\n    global.get $x{}\n    global.get $x{}\n    i64.mul\n    i64.const 32\n    i64.shr_s\n    global.set $x{}",
+                    "        ;; MULH - high part of signed multiplication\n        ;; TODO: implement 128-bit multiplication\n        global.get $x{}\n        global.get $x{}\n        i64.mul\n        i64.const 32\n        i64.shr_s\n        global.set $x{}",
                     rs1_num, rs2_num, rd_num
                 )
                 .unwrap();
@@ -944,7 +949,7 @@ impl WasmEmitter {
                 let rd_num = self.reg_num(rd)?;
                 writeln!(
                     &mut self.wat_code,
-                    "    ;; MULHSU - TODO\n    i64.const 0\n    global.set $x{}",
+                    "        ;; MULHSU - TODO\n        i64.const 0\n        global.set $x{}",
                     rd_num
                 )
                 .unwrap();
@@ -954,7 +959,7 @@ impl WasmEmitter {
                 let rd_num = self.reg_num(rd)?;
                 writeln!(
                     &mut self.wat_code,
-                    "    ;; MULHU - TODO\n    i64.const 0\n    global.set $x{}",
+                    "        ;; MULHU - TODO\n        i64.const 0\n        global.set $x{}",
                     rd_num
                 )
                 .unwrap();
@@ -966,7 +971,7 @@ impl WasmEmitter {
                 let rs2_num = self.reg_num(rs2)?;
                 writeln!(
                     &mut self.wat_code,
-                    "    ;; DIV - signed division with zero check\n    global.get $x{}\n    i64.eqz\n    if\n      i64.const -1\n      global.set $x{}\n    else\n      global.get $x{}\n      global.get $x{}\n      i64.div_s\n      global.set $x{}\n    end",
+                    "        ;; DIV - signed division with zero check\n        global.get $x{}\n        i64.eqz\n        if\n      i64.const -1\n      global.set $x{}\n        else\n      global.get $x{}\n      global.get $x{}\n      i64.div_s\n      global.set $x{}\n        end",
                     rs2_num, rd_num, rs1_num, rs2_num, rd_num
                 )
                 .unwrap();
@@ -978,7 +983,7 @@ impl WasmEmitter {
                 let rs2_num = self.reg_num(rs2)?;
                 writeln!(
                     &mut self.wat_code,
-                    "    ;; DIVU - unsigned division with zero check\n    global.get $x{}\n    i64.eqz\n    if\n      i64.const -1\n      global.set $x{}\n    else\n      global.get $x{}\n      global.get $x{}\n      i64.div_u\n      global.set $x{}\n    end",
+                    "        ;; DIVU - unsigned division with zero check\n        global.get $x{}\n        i64.eqz\n        if\n      i64.const -1\n      global.set $x{}\n        else\n      global.get $x{}\n      global.get $x{}\n      i64.div_u\n      global.set $x{}\n        end",
                     rs2_num, rd_num, rs1_num, rs2_num, rd_num
                 )
                 .unwrap();
@@ -990,7 +995,7 @@ impl WasmEmitter {
                 let rs2_num = self.reg_num(rs2)?;
                 writeln!(
                     &mut self.wat_code,
-                    "    ;; REM - signed remainder with zero check\n    global.get $x{}\n    i64.eqz\n    if\n      global.get $x{}\n      global.set $x{}\n    else\n      global.get $x{}\n      global.get $x{}\n      i64.rem_s\n      global.set $x{}\n    end",
+                    "        ;; REM - signed remainder with zero check\n        global.get $x{}\n        i64.eqz\n        if\n      global.get $x{}\n      global.set $x{}\n        else\n      global.get $x{}\n      global.get $x{}\n      i64.rem_s\n      global.set $x{}\n        end",
                     rs2_num, rs1_num, rd_num, rs1_num, rs2_num, rd_num
                 )
                 .unwrap();
@@ -1002,7 +1007,7 @@ impl WasmEmitter {
                 let rs2_num = self.reg_num(rs2)?;
                 writeln!(
                     &mut self.wat_code,
-                    "    ;; REMU - unsigned remainder with zero check\n    global.get $x{}\n    i64.eqz\n    if\n      global.get $x{}\n      global.set $x{}\n    else\n      global.get $x{}\n      global.get $x{}\n      i64.rem_u\n      global.set $x{}\n    end",
+                    "        ;; REMU - unsigned remainder with zero check\n        global.get $x{}\n        i64.eqz\n        if\n      global.get $x{}\n      global.set $x{}\n        else\n      global.get $x{}\n      global.get $x{}\n      i64.rem_u\n      global.set $x{}\n        end",
                     rs2_num, rs1_num, rd_num, rs1_num, rs2_num, rd_num
                 )
                 .unwrap();
@@ -1023,7 +1028,7 @@ impl WasmEmitter {
                 let rs2_num = self.reg_num(rs2)?;
                 writeln!(
                     &mut self.wat_code,
-                    "    global.get $x{}\n    i32.wrap_i64\n    global.get $x{}\n    i32.wrap_i64\n    i32.mul\n    i64.extend_i32_s\n    global.set $x{}",
+                    "        global.get $x{}\n        i32.wrap_i64\n        global.get $x{}\n        i32.wrap_i64\n        i32.mul\n        i64.extend_i32_s\n        global.set $x{}",
                     rs1_num, rs2_num, rd_num
                 )
                 .unwrap();
@@ -1035,7 +1040,7 @@ impl WasmEmitter {
                 let rs2_num = self.reg_num(rs2)?;
                 writeln!(
                     &mut self.wat_code,
-                    "    ;; DIVW - 32-bit signed division with zero check\n    global.get $x{}\n    i32.wrap_i64\n    i32.eqz\n    if\n      i64.const -1\n      global.set $x{}\n    else\n      global.get $x{}\n      i32.wrap_i64\n      global.get $x{}\n      i32.wrap_i64\n      i32.div_s\n      i64.extend_i32_s\n      global.set $x{}\n    end",
+                    "        ;; DIVW - 32-bit signed division with zero check\n        global.get $x{}\n        i32.wrap_i64\n        i32.eqz\n        if\n      i64.const -1\n      global.set $x{}\n        else\n      global.get $x{}\n      i32.wrap_i64\n      global.get $x{}\n      i32.wrap_i64\n      i32.div_s\n      i64.extend_i32_s\n      global.set $x{}\n        end",
                     rs2_num, rd_num, rs1_num, rs2_num, rd_num
                 )
                 .unwrap();
@@ -1047,7 +1052,7 @@ impl WasmEmitter {
                 let rs2_num = self.reg_num(rs2)?;
                 writeln!(
                     &mut self.wat_code,
-                    "    ;; DIVUW - 32-bit unsigned division with zero check\n    global.get $x{}\n    i32.wrap_i64\n    i32.eqz\n    if\n      i64.const -1\n      global.set $x{}\n    else\n      global.get $x{}\n      i32.wrap_i64\n      global.get $x{}\n      i32.wrap_i64\n      i32.div_u\n      i64.extend_i32_s\n      global.set $x{}\n    end",
+                    "        ;; DIVUW - 32-bit unsigned division with zero check\n        global.get $x{}\n        i32.wrap_i64\n        i32.eqz\n        if\n      i64.const -1\n      global.set $x{}\n        else\n      global.get $x{}\n      i32.wrap_i64\n      global.get $x{}\n      i32.wrap_i64\n      i32.div_u\n      i64.extend_i32_s\n      global.set $x{}\n        end",
                     rs2_num, rd_num, rs1_num, rs2_num, rd_num
                 )
                 .unwrap();
@@ -1059,7 +1064,7 @@ impl WasmEmitter {
                 let rs2_num = self.reg_num(rs2)?;
                 writeln!(
                     &mut self.wat_code,
-                    "    ;; REMW - 32-bit signed remainder with zero check\n    global.get $x{}\n    i32.wrap_i64\n    i32.eqz\n    if\n      global.get $x{}\n      global.set $x{}\n    else\n      global.get $x{}\n      i32.wrap_i64\n      global.get $x{}\n      i32.wrap_i64\n      i32.rem_s\n      i64.extend_i32_s\n      global.set $x{}\n    end",
+                    "        ;; REMW - 32-bit signed remainder with zero check\n        global.get $x{}\n        i32.wrap_i64\n        i32.eqz\n        if\n      global.get $x{}\n      global.set $x{}\n        else\n      global.get $x{}\n      i32.wrap_i64\n      global.get $x{}\n      i32.wrap_i64\n      i32.rem_s\n      i64.extend_i32_s\n      global.set $x{}\n        end",
                     rs2_num, rs1_num, rd_num, rs1_num, rs2_num, rd_num
                 )
                 .unwrap();
@@ -1071,7 +1076,7 @@ impl WasmEmitter {
                 let rs2_num = self.reg_num(rs2)?;
                 writeln!(
                     &mut self.wat_code,
-                    "    ;; REMUW - 32-bit unsigned remainder with zero check\n    global.get $x{}\n    i32.wrap_i64\n    i32.eqz\n    if\n      global.get $x{}\n      global.set $x{}\n    else\n      global.get $x{}\n      i32.wrap_i64\n      global.get $x{}\n      i32.wrap_i64\n      i32.rem_u\n      i64.extend_i32_s\n      global.set $x{}\n    end",
+                    "        ;; REMUW - 32-bit unsigned remainder with zero check\n        global.get $x{}\n        i32.wrap_i64\n        i32.eqz\n        if\n      global.get $x{}\n      global.set $x{}\n        else\n      global.get $x{}\n      i32.wrap_i64\n      global.get $x{}\n      i32.wrap_i64\n      i32.rem_u\n      i64.extend_i32_s\n      global.set $x{}\n        end",
                     rs2_num, rs1_num, rd_num, rs1_num, rs2_num, rd_num
                 )
                 .unwrap();
@@ -1091,7 +1096,7 @@ impl WasmEmitter {
                 let rs1_num = self.reg_num(rs1)?;
                 writeln!(
                     &mut self.wat_code,
-                    "    ;; VSETVLI - configure vector length\n    global.get $x{}\n    global.set $vl\n    global.get $vl\n    global.set $x{}",
+                    "        ;; VSETVLI - configure vector length\n        global.get $x{}\n        global.set $vl\n        global.get $vl\n        global.set $x{}",
                     rs1_num, rd_num
                 )
                 .unwrap();
@@ -1101,7 +1106,7 @@ impl WasmEmitter {
                 let rd_num = self.reg_num(rd)?;
                 writeln!(
                     &mut self.wat_code,
-                    "    ;; VSETIVLI - configure vector length (immediate)\n    ;; TODO: parse immediate\n    i64.const 0\n    global.set $x{}",
+                    "        ;; VSETIVLI - configure vector length (immediate)\n        ;; TODO: parse immediate\n        i64.const 0\n        global.set $x{}",
                     rd_num
                 )
                 .unwrap();
@@ -1113,7 +1118,7 @@ impl WasmEmitter {
                 let rs2_num = self.reg_num(rs2)?;
                 writeln!(
                     &mut self.wat_code,
-                    "    ;; VSETVL - configure vector length\n    global.get $x{}\n    global.set $vl\n    global.get $x{}\n    global.set $vtype\n    global.get $vl\n    global.set $x{}",
+                    "        ;; VSETVL - configure vector length\n        global.get $x{}\n        global.set $vl\n        global.get $x{}\n        global.set $vtype\n        global.get $vl\n        global.set $x{}",
                     rs1_num, rs2_num, rd_num
                 )
                 .unwrap();
@@ -1123,7 +1128,7 @@ impl WasmEmitter {
             _ => {
                 writeln!(
                     &mut self.wat_code,
-                    "    ;; Vector instruction: {:?} - TODO",
+                    "        ;; Vector instruction: {:?} - TODO",
                     instr
                 )
                 .unwrap();

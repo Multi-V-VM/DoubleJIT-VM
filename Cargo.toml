@@ -30,5 +30,8 @@ name = "cache_usage"
 [[example]]
 name = "perf_demo"
 
+[[example]]
+name = "optimizer_demo"
+
 [package.metadata.docs.rs]
 all-features = true

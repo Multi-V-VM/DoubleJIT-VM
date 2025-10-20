@@ -6,8 +6,9 @@ use wasmer::sys::EngineBuilder;
 use wasmer_compiler_singlepass::Singlepass;
 use wasmer_wasix::{WasiEnvBuilder, WasiFunctionEnv};
 use std::sync::{Arc, Mutex};
+use crate::codegen::optimizer::{WatOptimizer, OptLevel as WatOptLevel, OptStats};
 
-/// Optimization level for Cranelift code generation
+/// Optimization level for WASM compilation
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OptLevel {
     /// No optimizations - fastest compilation
@@ -18,9 +19,20 @@ pub enum OptLevel {
     SpeedAndSize,
 }
 
+impl OptLevel {
+    /// Convert to WAT optimizer level
+    fn to_wat_opt_level(self) -> WatOptLevel {
+        match self {
+            OptLevel::None => WatOptLevel::None,
+            OptLevel::Speed => WatOptLevel::Moderate,
+            OptLevel::SpeedAndSize => WatOptLevel::Aggressive,
+        }
+    }
+}
+
 /// Backend builder that compiles WAT to native code using Singlepass
 ///
-/// Pipeline: WAT → WASM bytecode → Singlepass → native x86/ARM code → Wasmer runtime
+/// Pipeline: WAT → WAT Optimization → WASM bytecode → Singlepass → native x86/ARM code → Wasmer runtime
 ///
 /// The Singlepass compiler is a fast single-pass compiler that can handle very large functions
 /// without the code size limitations of Cranelift. It generates native code for:
@@ -33,6 +45,8 @@ pub struct WasmBuilder {
     store: Store,
     /// Optimization level
     opt_level: OptLevel,
+    /// WAT optimization statistics (from last compilation)
+    last_opt_stats: Option<OptStats>,
 }
 
 impl WasmBuilder {
@@ -57,7 +71,12 @@ impl WasmBuilder {
         // Create store with the Singlepass engine
         let store = Store::new(engine.clone());
 
-        Ok(Self { engine, store, opt_level })
+        Ok(Self {
+            engine,
+            store,
+            opt_level,
+            last_opt_stats: None,
+        })
     }
 
     /// Get the current optimization level
@@ -65,17 +84,38 @@ impl WasmBuilder {
         self.opt_level
     }
 
+    /// Get WAT optimization statistics from last compilation
+    pub fn last_optimization_stats(&self) -> Option<&OptStats> {
+        self.last_opt_stats.as_ref()
+    }
+
     /// Compile WAT (WebAssembly Text) to native code and create a Wasmer module
     ///
     /// This performs the full compilation pipeline:
-    /// 1. Parse WAT to WASM bytecode
-    /// 2. Cranelift compiles WASM to native machine code (x86-64/ARM)
-    /// 3. Returns a compiled Module ready for instantiation
-    pub fn compile_wat(&self, wat_source: &str) -> Result<Module, Box<dyn std::error::Error>> {
-        // Step 1: Convert WAT to WASM bytecode
-        let wasm_bytes = wat2wasm(wat_source.as_bytes())?;
+    /// 1. Optimize WAT code (constant propagation, dead code elimination, etc.)
+    /// 2. Parse optimized WAT to WASM bytecode
+    /// 3. Singlepass compiles WASM to native machine code (x86-64/ARM)
+    /// 4. Returns a compiled Module ready for instantiation
+    pub fn compile_wat(&mut self, wat_source: &str) -> Result<Module, Box<dyn std::error::Error>> {
+        // Step 1: Optimize WAT code before compilation
+        let wat_opt_level = self.opt_level.to_wat_opt_level();
+        let optimized_wat = if wat_opt_level != WatOptLevel::None {
+            let mut optimizer = WatOptimizer::new(wat_opt_level);
+            let optimized = optimizer.optimize(wat_source);
 
-        // Step 2: Compile WASM to native code using Cranelift
+            // Store optimization statistics
+            self.last_opt_stats = Some(optimizer.stats().clone());
+
+            optimized
+        } else {
+            self.last_opt_stats = None;
+            wat_source.to_string()
+        };
+
+        // Step 2: Convert optimized WAT to WASM bytecode
+        let wasm_bytes = wat2wasm(optimized_wat.as_bytes())?;
+
+        // Step 3: Compile WASM to native code using Singlepass
         // The engine automatically selects the appropriate target (x86-64, ARM, etc.)
         let module = Module::new(&self.store, wasm_bytes)?;
 
@@ -121,6 +161,8 @@ pub struct SyscallEnv {
     set_exit_flag_func: Option<wasmer::Function>,
     /// WASI environment for handling file I/O through WASI
     wasi_env: Option<Arc<Mutex<WasiFunctionEnv>>>,
+    /// Program break (heap end) for brk syscall
+    program_break: Arc<Mutex<u64>>,
 }
 
 /// Runtime environment for executing compiled RISC-V code
@@ -147,11 +189,13 @@ impl RiscVRuntime {
         state: Arc<Mutex<crate::middleend::RiscVState>>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         // Create syscall environment with state
+        // Initialize program break at 0x100000 (1MB) - above .bss section
         let syscall_env = Arc::new(Mutex::new(SyscallEnv {
             state: state.clone(),
             memory: None, // Will be set after instance creation
             set_exit_flag_func: None, // Will be set after instance creation
             wasi_env: None, // Will be set after WASI initialization
+            program_break: Arc::new(Mutex::new(0x100000)), // Start heap at 1MB
         }));
 
         // Create function environment for host functions
@@ -170,37 +214,60 @@ impl RiscVRuntime {
                     &env,
                     Self::debug_print_handler
                 ),
+            },
+            // Provide stub WASI functions to avoid needing full WASI initialization
+            // This prevents TLS conflicts with binaries that manage their own TLS
+            "wasi_snapshot_preview1" => {
+                "fd_write" => Function::new_typed_with_env(
+                    &mut store,
+                    &env,
+                    |_env: FunctionEnvMut<Arc<Mutex<SyscallEnv>>>, _fd: i32, _iovs: i32, _iovs_len: i32, _nwritten: i32| -> i32 {
+                        // Stub: pretend we wrote data successfully
+                        0 // success
+                    }
+                ),
+                "fd_read" => Function::new_typed_with_env(
+                    &mut store,
+                    &env,
+                    |_env: FunctionEnvMut<Arc<Mutex<SyscallEnv>>>, _fd: i32, _iovs: i32, _iovs_len: i32, _nread: i32| -> i32 {
+                        // Stub: pretend we read nothing (EOF)
+                        0 // success
+                    }
+                ),
+                "proc_exit" => Function::new_typed_with_env(
+                    &mut store,
+                    &env,
+                    |mut env: FunctionEnvMut<Arc<Mutex<SyscallEnv>>>, code: i32| {
+                        // Properly handle exit - set the exit flag
+                        let set_exit_flag_func = {
+                            let syscall_env = env.data().lock().unwrap();
+                            syscall_env.set_exit_flag_func.clone()
+                        };
+
+                        if let Some(func) = set_exit_flag_func {
+                            let _ = func.call(&mut env, &[Value::I32(1)]);
+                        }
+
+                        // Exit by terminating with a runtime error
+                        // This properly stops execution
+                        eprintln!("DEBUG: proc_exit called with code {}", code);
+                        panic!("WASI proc_exit called with code: {}", code);
+                    }
+                ),
             }
         };
 
-        // Try to create WASI environment if the module uses WASI
-        // If the module doesn't import WASI functions, we'll just use custom imports
-        let engine = store.engine().clone();
-        let mut wasi_builder = WasiEnvBuilder::new("doublejit-vm");
-        wasi_builder.set_engine(engine);
-        let wasi_env = wasi_builder.build()?;
-        let mut wasi_fn_env = WasiFunctionEnv::new(&mut store, wasi_env);
+        // IMPORTANT: Do NOT use WASI at all!
+        // WASI has its own TLS (thread-local storage) initialization that conflicts
+        // with binaries compiled with libc (like add_test) that manage their own TLS
+        // via set_tid_address and arch_prctl syscalls.
+        //
+        // We only use our custom syscall imports which properly stub TLS syscalls
+        // without setting up conflicting TLS state.
+        let import_object = custom_imports;
 
-        // Try to get WASI imports - if it fails (module doesn't use WASI), just use custom imports
-        let import_object = match wasi_fn_env.import_object(&mut store, &module) {
-            Ok(wasi_imports) => {
-                // Module uses WASI - merge WASI imports with custom imports
-                let mut combined = wasi_imports.clone();
-                combined.extend(&custom_imports);
-                combined
-            }
-            Err(_) => {
-                // Module doesn't use WASI - just use custom imports
-                custom_imports
-            }
-        };
-
-        // Instantiate the module with the imports
+        // Instantiate the module with only custom imports (no WASI)
         let instance = Instance::new(&mut store, &module, &import_object)?;
-
-        // Initialize the WASI environment if it was used
-        // Note: This may fail if WASI wasn't used, but that's okay - we'll ignore the error
-        let wasi_initialized = wasi_fn_env.initialize(&mut store, instance.clone()).is_ok();
 
         // Get memory and store it in the environment
         if let Ok(memory) = instance.exports.get_memory("memory") {
@@ -213,10 +280,10 @@ impl RiscVRuntime {
             syscall_env.lock().unwrap().set_exit_flag_func = Some(func.clone());
         }
 
-        // Store WASI environment in syscall_env if it was initialized successfully
-        if wasi_initialized {
-            syscall_env.lock().unwrap().wasi_env = Some(Arc::new(Mutex::new(wasi_fn_env)));
-        }
+        // WASI environment not stored - we skip WASI init to avoid TLS conflicts
+        // if wasi_initialized {
+        //     syscall_env.lock().unwrap().wasi_env = Some(Arc::new(Mutex::new(wasi_fn_env)));
+        // }
 
         Ok(Self {
             module,
@@ -227,8 +294,31 @@ impl RiscVRuntime {
         })
     }
 
+    /// Initialize WASM register globals from RiscVState
+    pub fn init_registers(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        let set_reg = self.instance.exports.get_function("set_reg")?;
+
+        // Copy all registers from RiscVState to WASM globals
+        let reg_values: Vec<i64> = {
+            let state = self.state.lock().unwrap();
+            state.x_regs.to_vec()
+        };
+
+        for (i, &val) in reg_values.iter().enumerate() {
+            if val != 0 {  // Only set non-zero registers for efficiency
+                set_reg.call(&mut self.store, &[Value::I32(i as i32), Value::I64(val)])?;
+                eprintln!("DEBUG: Initialized register x{} = 0x{:x}", i, val);
+            }
+        }
+
+        Ok(())
+    }
+
     /// Execute the main function (runs native code compiled by Cranelift)
     pub fn execute(&mut self) -> Result<i32, Box<dyn std::error::Error>> {
+        // Initialize registers from state BEFORE executing
+        self.init_registers()?;
+
         let main = self.instance.exports.get_function("main")?;
         let result = main.call(&mut self.store, &[])?;
 
@@ -308,11 +398,12 @@ impl RiscVRuntime {
         arg5: i64,
         arg6: i64,
     ) -> i64 {
-        // Debug: log every syscall
-        eprintln!("SYSCALL: num={}, args=({}, {}, {}, {}, {}, {})", syscall_num, arg1, arg2, arg3, arg4, arg5, arg6);
+        // Debug: log every syscall with hex addresses for easier debugging
+        eprintln!("SYSCALL: num={} (0x{:x}), args=(0x{:x}, 0x{:x}, 0x{:x}, 0x{:x}, 0x{:x}, 0x{:x})",
+                 syscall_num, syscall_num as u64, arg1 as u64, arg2 as u64, arg3 as u64, arg4 as u64, arg5 as u64, arg6 as u64);
 
         // Implement RISC-V Linux syscalls
-        match syscall_num {
+        let result = match syscall_num {
             93 => {
                 // exit(status) - set exit flag to break interpreter loop
                 eprintln!("DEBUG: exit syscall called with status={}", arg1);
@@ -425,9 +516,26 @@ impl RiscVRuntime {
                 0 // return bytes read
             }
             214 => {
-                // brk - memory allocation
-                // For now, just return the requested address
-                arg1
+                // brk - memory allocation/deallocation
+                // brk(0) returns current program break
+                // brk(addr) sets new program break and returns it on success
+                let program_break_arc = env.data().lock().unwrap().program_break.clone();
+                let mut current_break = program_break_arc.lock().unwrap();
+
+                if arg1 == 0 {
+                    // brk(0) - return current program break
+                    eprintln!("DEBUG: brk(0) returning current break: 0x{:x}", *current_break);
+                    *current_break as i64
+                } else {
+                    // brk(addr) - set new program break
+                    let new_break = arg1 as u64;
+                    eprintln!("DEBUG: brk(0x{:x}) - setting new break (was 0x{:x})", new_break, *current_break);
+
+                    // TODO: Check if new_break is within reasonable bounds
+                    // For now, just accept it
+                    *current_break = new_break;
+                    new_break as i64
+                }
             }
             // Common syscalls that programs might use
             57 => {
@@ -442,22 +550,7 @@ impl RiscVRuntime {
                 // fstat(fd, statbuf)
                 -1 // EBADF
             }
-            96 => {
-                // set_tid_address
-                1 // return fake tid
-            }
-            134 => {
-                // rt_sigaction
-                0 // success (ignore signals)
-            }
-            135 => {
-                // rt_sigprocmask
-                0 // success (ignore signals)
-            }
-            160 => {
-                // uname
-                0 // success (fake it)
-            }
+            // Note: syscalls 96, 134, 135, 160 are implemented later with proper TLS handling
             169 => {
                 // gettimeofday
                 0 // success (return 0 time)
@@ -602,6 +695,82 @@ impl RiscVRuntime {
                 eprintln!("DEBUG: sysinfo syscall (stubbed)");
                 0 // Success (stub - return fake system info)
             }
+            135 => {
+                // rt_sigprocmask(how, set, oldset, sigsetsize)
+                // Signal mask manipulation - critical for libc
+                // eprintln!("DEBUG: rt_sigprocmask syscall: how={}, set=0x{:x}, oldset=0x{:x}, size={}",
+                //     arg1, arg2, arg3, arg4);
+
+                // For now, stub this - just succeed without changing anything
+                // In a full implementation, we'd need to track signal masks
+                // but for JIT execution, signals are handled by the host OS
+                0 // Success
+            }
+            134 => {
+                // rt_sigaction(signum, act, oldact, sigsetsize)
+                // Signal handler registration
+                eprintln!("DEBUG: rt_sigaction syscall: sig={}, act=0x{:x}, oldact=0x{:x}",
+                    arg1, arg2, arg3);
+                0 // Success (stub)
+            }
+            13 => {
+                // rt_sigreturn() - return from signal handler
+                eprintln!("DEBUG: rt_sigreturn syscall (stubbed)");
+                0
+            }
+            // Note: syscall 99 (set_robust_list) already defined above
+            96 => {
+                // set_tid_address(tidptr)
+                eprintln!("DEBUG: set_tid_address syscall: tidptr=0x{:x}", arg1);
+                1000 // Return fake TID
+            }
+            160 => {
+                // uname(buf) - system information
+                eprintln!("DEBUG: uname syscall: buf=0x{:x}", arg1);
+
+                let memory = env.data().lock().unwrap().memory.clone();
+
+                if let Some(memory) = memory {
+                    let view = memory.view(&env);
+                    let buf_addr = arg1 as u64;
+
+                    // Fill in minimal utsname structure (6 strings of 65 bytes each)
+                    let sysname = b"Linux\0";
+                    let nodename = b"doublejit\0";
+                    let release = b"5.15.0\0";
+                    let version = b"#1 SMP\0";
+                    let machine = b"riscv64\0";
+
+                    // Write sysname at offset 0
+                    for (i, &byte) in sysname.iter().enumerate() {
+                        view.write_u8(buf_addr + i as u64, byte).ok();
+                    }
+
+                    // Write nodename at offset 65
+                    for (i, &byte) in nodename.iter().enumerate() {
+                        view.write_u8(buf_addr + 65 + i as u64, byte).ok();
+                    }
+
+                    // Write release at offset 130
+                    for (i, &byte) in release.iter().enumerate() {
+                        view.write_u8(buf_addr + 130 + i as u64, byte).ok();
+                    }
+
+                    // Write version at offset 195
+                    for (i, &byte) in version.iter().enumerate() {
+                        view.write_u8(buf_addr + 195 + i as u64, byte).ok();
+                    }
+
+                    // Write machine at offset 260
+                    for (i, &byte) in machine.iter().enumerate() {
+                        view.write_u8(buf_addr + 260 + i as u64, byte).ok();
+                    }
+
+                    0 // Success
+                } else {
+                    -1 // EFAULT
+                }
+            }
             _ => {
                 // Check if syscall number looks like garbage (way too high)
                 if syscall_num > 500 || syscall_num < 0 {
@@ -611,12 +780,21 @@ impl RiscVRuntime {
                     // Return error to help debug
                     -38 // ENOSYS
                 } else {
-                    eprintln!("Unknown syscall: {} (args: {}, {}, {}, {}, {}, {})",
+                    eprintln!("⚠️  UNKNOWN SYSCALL {}: args=({}, {}, {}, {}, {}, {}) - returning ENOSYS",
                              syscall_num, arg1, arg2, arg3, arg4, arg5, arg6);
                     -38 // ENOSYS
                 }
             }
+        };
+
+        // Log the result of the syscall
+        if result < 0 {
+            eprintln!("  → returned ERROR: {} ({})", result, if result == -38 { "ENOSYS" } else if result == -1 { "EFAULT" } else if result == -2 { "ENOENT" } else { "?" });
+        } else {
+            eprintln!("  → returned: {}", result);
         }
+
+        result
     }
 
     /// Debug print handler (called from native code)
@@ -641,15 +819,27 @@ impl RuntimeBuilder {
         })
     }
 
+    /// Create a new runtime builder with a specific optimization level
+    pub fn with_opt_level(opt_level: OptLevel) -> Result<Self, Box<dyn std::error::Error>> {
+        Ok(Self {
+            wasm_builder: WasmBuilder::with_opt_level(opt_level)?,
+        })
+    }
+
+    /// Get optimization statistics from last compilation
+    pub fn last_optimization_stats(&self) -> Option<&OptStats> {
+        self.wasm_builder.last_optimization_stats()
+    }
+
     /// Build a runtime from WAT source code
     ///
-    /// This compiles WAT → WASM → native code using Cranelift
+    /// This compiles WAT → WAT Optimization → WASM → native code using Singlepass
     pub fn build_from_wat(
-        &self,
+        &mut self,
         wat_source: &str,
         state: Arc<Mutex<crate::middleend::RiscVState>>,
     ) -> Result<RiscVRuntime, Box<dyn std::error::Error>> {
-        // Compile WAT to native code using Cranelift
+        // Compile WAT to native code (includes WAT optimization)
         let module = self.wasm_builder.compile_wat(wat_source)?;
 
         // Create store for this runtime instance
