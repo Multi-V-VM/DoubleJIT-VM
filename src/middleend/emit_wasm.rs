@@ -1,5 +1,5 @@
 use crate::frontend::instruction::{
-    Instruction, Instr, RV32Instr, RV64Instr, RV32I, RV64I, RV32M, RV64M, RVV, Reg, Xx, Rd, Rs1, Rs2
+    Instruction, Instr, RV32Instr, RV64Instr, RV32I, RV64I, RV32M, RV64M, RVV, Reg, Xx, Rd, Rs1, Rs2, Rs3, VM
 };
 use std::fmt::Write as FmtWrite;
 
@@ -33,7 +33,8 @@ impl WasmEmitter {
     pub fn start_function(&mut self, name: &str) {
         writeln!(
             &mut self.wat_code,
-            "  (func ${} (export \"{}\")",
+            // Predeclare a few locals used by vector/SIMD emission
+            "  (func ${} (export \"{}\") (local $tmp_addr i32) (local $tmp_v1 v128) (local $tmp_v2 v128) (local $tmp_v v128)",
             name, name
         )
         .unwrap();
@@ -1146,6 +1147,110 @@ impl WasmEmitter {
                     &mut self.wat_code,
                     "        ;; VSETVL - configure vector length\n        global.get $x{}\n        global.set $vl\n        global.get $x{}\n        global.set $vtype\n        global.get $vl\n        global.set $x{}",
                     rs1_num, rs2_num, rd_num
+                )
+                .unwrap();
+            }
+
+            // Unit-stride vector loads (SIMD path for 32-bit elements)
+            VLE32_V(Rd(vd), Rs1(rs1), VM(true)) => {
+                let vd_num = self.reg_num(vd)? as i32;
+                let rs1_num = self.reg_num(rs1)?;
+                let vd_off = vd_num * 16; // v128 per vreg
+                writeln!(
+                    &mut self.wat_code,
+                    "        ;; VLE32.V v{}, (x{}) -> vreg[v{}]\n        ;; dest addr = vreg_base + v*16\n        global.get $vreg_base\n        i32.const {}\n        i32.add\n        ;; value = *mem[x_rs1] as v128\n        global.get $x{}\n        call $vaddr_to_offset\n        v128.load\n        v128.store",
+                    vd_num, rs1_num, vd_num, vd_off, rs1_num
+                )
+                .unwrap();
+            }
+
+            // Unit-stride vector stores (SIMD path for 32-bit elements)
+            VSE32_V(Rs3(vs3), Rs1(rs1), VM(true)) => {
+                let vs3_num = self.reg_num(vs3)? as i32;
+                let rs1_num = self.reg_num(rs1)?;
+                let vs3_off = vs3_num * 16; // v128 per vreg
+                writeln!(
+                    &mut self.wat_code,
+                    "        ;; VSE32.V v{}, (x{})\n        ;; mem addr = x_rs1\n        global.get $x{}\n        call $vaddr_to_offset\n        ;; value = vreg[v{}]\n        global.get $vreg_base\n        i32.const {}\n        i32.add\n        v128.load\n        v128.store",
+                    vs3_num, rs1_num, rs1_num, vs3_num, vs3_off
+                )
+                .unwrap();
+            }
+
+            // Vector integer adds: VADD.VV (unmasked) using i32x4 lanes
+            VADD_VV(Rd(vd), Rs1(vs1), Rs2(vs2), VM(true)) => {
+                let vd_num = self.reg_num(vd)? as i32;
+                let vs1_num = self.reg_num(vs1)? as i32;
+                let vs2_num = self.reg_num(vs2)? as i32;
+                let vd_off = vd_num * 16;
+                let vs1_off = vs1_num * 16;
+                let vs2_off = vs2_num * 16;
+                writeln!(
+                    &mut self.wat_code,
+                    "        ;; VADD.VV v{}, v{}, v{} (i32x4)\n        ;; tmp_addr = vreg_base + vd*16\n        global.get $vreg_base\n        i32.const {}\n        i32.add\n        local.set $tmp_addr\n        ;; tmp_v1 = vreg[vs1]\n        global.get $vreg_base\n        i32.const {}\n        i32.add\n        v128.load\n        local.set $tmp_v1\n        ;; tmp_v2 = vreg[vs2]\n        global.get $vreg_base\n        i32.const {}\n        i32.add\n        v128.load\n        local.set $tmp_v2\n        ;; store tmp_v1 + tmp_v2 into vreg[vd]\n        local.get $tmp_addr\n        local.get $tmp_v1\n        local.get $tmp_v2\n        i32x4.add\n        v128.store",
+                    vd_num, vs1_num, vs2_num, vd_off, vs1_off, vs2_off
+                )
+                .unwrap();
+            }
+
+            // VSUB.VV (i32x4 lanes)
+            VSUB_VV(Rd(vd), Rs1(vs1), Rs2(vs2), VM(true)) => {
+                let vd_num = self.reg_num(vd)? as i32;
+                let vs1_num = self.reg_num(vs1)? as i32;
+                let vs2_num = self.reg_num(vs2)? as i32;
+                let vd_off = vd_num * 16;
+                let vs1_off = vs1_num * 16;
+                let vs2_off = vs2_num * 16;
+                writeln!(
+                    &mut self.wat_code,
+                    "        ;; VSUB.VV v{}, v{}, v{} (i32x4)\n        global.get $vreg_base\n        i32.const {}\n        i32.add\n        local.set $tmp_addr\n        global.get $vreg_base\n        i32.const {}\n        i32.add\n        v128.load\n        local.set $tmp_v1\n        global.get $vreg_base\n        i32.const {}\n        i32.add\n        v128.load\n        local.set $tmp_v2\n        local.get $tmp_addr\n        local.get $tmp_v1\n        local.get $tmp_v2\n        i32x4.sub\n        v128.store",
+                    vd_num, vs1_num, vs2_num, vd_off, vs1_off, vs2_off
+                )
+                .unwrap();
+            }
+
+            // Bitwise ops (i32x4 lanes)
+            VAND_VV(Rd(vd), Rs1(vs1), Rs2(vs2), VM(true)) => {
+                let vd_num = self.reg_num(vd)? as i32;
+                let vs1_num = self.reg_num(vs1)? as i32;
+                let vs2_num = self.reg_num(vs2)? as i32;
+                let vd_off = vd_num * 16;
+                let vs1_off = vs1_num * 16;
+                let vs2_off = vs2_num * 16;
+                writeln!(
+                    &mut self.wat_code,
+                    "        ;; VAND.VV v{}, v{}, v{} (i32x4)\n        global.get $vreg_base\n        i32.const {}\n        i32.add\n        local.set $tmp_addr\n        global.get $vreg_base\n        i32.const {}\n        i32.add\n        v128.load\n        local.set $tmp_v1\n        global.get $vreg_base\n        i32.const {}\n        i32.add\n        v128.load\n        local.set $tmp_v2\n        local.get $tmp_addr\n        local.get $tmp_v1\n        local.get $tmp_v2\n        v128.and\n        v128.store",
+                    vd_num, vs1_num, vs2_num, vd_off, vs1_off, vs2_off
+                )
+                .unwrap();
+            }
+
+            VOR_VV(Rd(vd), Rs1(vs1), Rs2(vs2), VM(true)) => {
+                let vd_num = self.reg_num(vd)? as i32;
+                let vs1_num = self.reg_num(vs1)? as i32;
+                let vs2_num = self.reg_num(vs2)? as i32;
+                let vd_off = vd_num * 16;
+                let vs1_off = vs1_num * 16;
+                let vs2_off = vs2_num * 16;
+                writeln!(
+                    &mut self.wat_code,
+                    "        ;; VOR.VV v{}, v{}, v{} (i32x4)\n        global.get $vreg_base\n        i32.const {}\n        i32.add\n        local.set $tmp_addr\n        global.get $vreg_base\n        i32.const {}\n        i32.add\n        v128.load\n        local.set $tmp_v1\n        global.get $vreg_base\n        i32.const {}\n        i32.add\n        v128.load\n        local.set $tmp_v2\n        local.get $tmp_addr\n        local.get $tmp_v1\n        local.get $tmp_v2\n        v128.or\n        v128.store",
+                    vd_num, vs1_num, vs2_num, vd_off, vs1_off, vs2_off
+                )
+                .unwrap();
+            }
+
+            VXOR_VV(Rd(vd), Rs1(vs1), Rs2(vs2), VM(true)) => {
+                let vd_num = self.reg_num(vd)? as i32;
+                let vs1_num = self.reg_num(vs1)? as i32;
+                let vs2_num = self.reg_num(vs2)? as i32;
+                let vd_off = vd_num * 16;
+                let vs1_off = vs1_num * 16;
+                let vs2_off = vs2_num * 16;
+                writeln!(
+                    &mut self.wat_code,
+                    "        ;; VXOR.VV v{}, v{}, v{} (i32x4)\n        global.get $vreg_base\n        i32.const {}\n        i32.add\n        local.set $tmp_addr\n        global.get $vreg_base\n        i32.const {}\n        i32.add\n        v128.load\n        local.set $tmp_v1\n        global.get $vreg_base\n        i32.const {}\n        i32.add\n        v128.load\n        local.set $tmp_v2\n        local.get $tmp_addr\n        local.get $tmp_v1\n        local.get $tmp_v2\n        v128.xor\n        v128.store",
+                    vd_num, vs1_num, vs2_num, vd_off, vs1_off, vs2_off
                 )
                 .unwrap();
             }

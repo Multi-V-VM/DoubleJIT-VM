@@ -165,6 +165,15 @@ impl WasmModule {
   (global $vstart (mut i64) (i64.const 0))
   (global $vlenb (mut i64) (i64.const 256))
 
+  ;; Execution control and debug
+  (global $exit_flag (mut i32) (i32.const 0))
+  (global $instr_count (mut i64) (i64.const 0))
+  (global $entry_pc (mut i64) (i64.const 0))
+
+  ;; Vector register file base in linear memory (default 64KB)
+  ;; We model v0..v31 each as 16 bytes (v128) for SIMD path
+  (global $vreg_base (mut i32) (i32.const 65536))
+
   ;; Import syscall handler
   (import "env" "syscall" (func $syscall (param i64 i64 i64 i64 i64 i64 i64) (result i64)))
   (import "env" "debug_print" (func $debug_print (param i32)))
@@ -179,6 +188,12 @@ impl WasmModule {
   (func $zero_extend_32 (param $val i32) (result i64)
     local.get $val
     i64.extend_i32_u
+  )
+
+  ;; Helper: Translate RISC-V virtual address to linear memory offset (trivial mapping for now)
+  (func $vaddr_to_offset (param $vaddr i64) (result i32)
+    local.get $vaddr
+    i32.wrap_i64
   )
 
   ;; Helper: Get register value (returns 0 for x0)
