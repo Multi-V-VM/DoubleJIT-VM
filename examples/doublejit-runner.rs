@@ -136,6 +136,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
   ;; Import syscall handler (must come before globals)
   (import "env" "syscall" (func $syscall (param i64 i64 i64 i64 i64 i64 i64) (result i64)))
   (import "env" "debug_print" (func $debug_print (param i32)))
+  ;; CSR runtime helpers
+  (import "env" "csr_read_write" (func $csr_read_write (param i32 i64) (result i64)))
+  (import "env" "csr_read_set" (func $csr_read_set (param i32 i64) (result i64)))
+  (import "env" "csr_read_clear" (func $csr_read_clear (param i32 i64) (result i64)))
 
   ;; Import WASI functions for direct syscall translation
   (import "wasi_snapshot_preview1" "fd_write" (func $wasi_fd_write (param i32 i32 i32 i32) (result i32)))
@@ -593,6 +597,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     current_addr -= 8; // argv[0] = pointer to program name
     runtime.load_memory(current_addr as u32, &program_name_addr.to_le_bytes())?;
     let argv_addr = current_addr;
+    let envp_addr = argv_addr + 16; // points to first envp pointer (we placed only NULL)
 
     current_addr -= 8; // argc
     runtime.load_memory(current_addr as u32, &argc.to_le_bytes())?;
@@ -657,13 +662,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut s = state.lock().unwrap();
         s.x_regs[2] = final_sp as i64; // sp = x2
         s.x_regs[4] = tp as i64; // tp = x4 (thread pointer)
-        // IMPORTANT: Do NOT pre-initialize a0-a7! _start will set them up correctly.
-        // argc is read from the stack at sp+0, not passed in registers
-        // The _start routine will load main's address into a0 and call __libc_start_main
+        // Set process entry registers as Linux kernel would on RISC-V:
+        // a0=x10=argc, a1=x11=argv, a2=x12=envp
+        s.x_regs[10] = argc as i64;
+        s.x_regs[11] = argv_addr as i64;
+        s.x_regs[12] = envp_addr as i64;
         println!("         • Stack pointer (sp/x2) = 0x{:x}", final_sp);
         println!("         • Thread pointer (tp/x4) = 0x{:x}", tp);
-        println!("         • argc at stack[sp] = {}", argc);
-        println!("         • argv at stack[sp+8] = 0x{:x}", argv_addr);
+        println!("         • argc (a0/x10) = {}", argc);
+        println!("         • argv (a1/x11) = 0x{:x}", argv_addr);
+        println!("         • envp (a2/x12) = 0x{:x}", envp_addr);
         println!("         • _start will load main's address and call __libc_start_main");
     }
 

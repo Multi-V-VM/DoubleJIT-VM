@@ -1,5 +1,5 @@
 use crate::frontend::instruction::{
-    Instruction, Instr, RV32Instr, RV64Instr, RV32I, RV64I, RV32M, RV64M, RVV, Reg, Xx, Rd, Rs1, Rs2, Rs3, VM
+    Instruction, Instr, RV32Instr, RV64Instr, RV32I, RV64I, RV32M, RV64M, RVV, RVZcsr, Reg, Xx, Rd, Rs1, Rs2, Rs3, VM
 };
 use std::fmt::Write as FmtWrite;
 
@@ -16,6 +16,9 @@ pub struct WasmEmitter {
 
     /// Label counter for branches
     label_counter: usize,
+
+    /// Pending instructions to emit as a bucketized dispatch list
+    pending_instrs: Vec<(u64, Instr)>,
 }
 
 impl WasmEmitter {
@@ -26,6 +29,7 @@ impl WasmEmitter {
             instr_count: 0,
             in_block: false,
             label_counter: 0,
+            pending_instrs: Vec::new(),
         }
     }
 
@@ -33,8 +37,8 @@ impl WasmEmitter {
     pub fn start_function(&mut self, name: &str) {
         writeln!(
             &mut self.wat_code,
-            // Predeclare a few locals used by vector/SIMD emission
-            "  (func ${} (export \"{}\") (local $tmp_addr i32) (local $tmp_v1 v128) (local $tmp_v2 v128) (local $tmp_v v128)",
+            // Predeclare locals used by vector/SIMD emission and dispatch
+            "  (func ${} (export \"{}\") (local $tmp_addr i32) (local $tmp_v1 v128) (local $tmp_v2 v128) (local $tmp_v v128) (local $bucket i32)",
             name, name
         )
         .unwrap();
@@ -53,12 +57,6 @@ impl WasmEmitter {
         writeln!(&mut self.wat_code, "        return  ;; Exit function if exit_flag is set").unwrap();
         writeln!(&mut self.wat_code, "      end").unwrap();
 
-        // Watchdog at loop level: increments even if no instruction matches current PC
-        writeln!(&mut self.wat_code, "      ;; Loop-level watchdog increment").unwrap();
-        writeln!(&mut self.wat_code, "      global.get $instr_count").unwrap();
-        writeln!(&mut self.wat_code, "      i64.const 1").unwrap();
-        writeln!(&mut self.wat_code, "      i64.add").unwrap();
-        writeln!(&mut self.wat_code, "      global.set $instr_count").unwrap();
         // If PC becomes 0 unexpectedly, re-seed from $entry_pc (provided by embedding runtime)
         writeln!(&mut self.wat_code, "      ;; Re-seed PC if zero").unwrap();
         writeln!(&mut self.wat_code, "      global.get $pc").unwrap();
@@ -67,16 +65,42 @@ impl WasmEmitter {
         writeln!(&mut self.wat_code, "        global.get $entry_pc").unwrap();
         writeln!(&mut self.wat_code, "        global.set $pc").unwrap();
         writeln!(&mut self.wat_code, "      end").unwrap();
-        writeln!(
-            &mut self.wat_code,
-            "      ;; Print PC every 4096 loops (when idle)\n      global.get $instr_count\n      i64.const 4096\n      i64.rem_u\n      i64.eqz\n      if\n        global.get $pc\n        i32.wrap_i64\n        call $debug_print\n      end"
-        ).unwrap();
+
+        // Compute dispatch bucket: bucket = ((pc >> 2) & 255)
+        writeln!(&mut self.wat_code, "      ;; Compute dispatch bucket from PC").unwrap();
+        writeln!(&mut self.wat_code, "      global.get $pc").unwrap();
+        writeln!(&mut self.wat_code, "      i64.const 2").unwrap();
+        writeln!(&mut self.wat_code, "      i64.shr_u").unwrap();
+        writeln!(&mut self.wat_code, "      i64.const 255").unwrap();
+        writeln!(&mut self.wat_code, "      i64.and").unwrap();
+        writeln!(&mut self.wat_code, "      i32.wrap_i64").unwrap();
+        writeln!(&mut self.wat_code, "      local.set $bucket").unwrap();
     }
 
     /// End the loop with exit flag check
     pub fn end_loop_with_exit_check(&mut self) {
-        // The exit flag check is now at the START of the loop
-        // This end just unconditionally branches back
+        // Emit grouped buckets (0..63), placing only matching PC checks in each
+        for bucket_id in 0..256 {
+            writeln!(
+                &mut self.wat_code,
+                "      ;; Bucket {}\n      local.get $bucket\n      i32.const {}\n      i32.eq\n      if",
+                bucket_id, bucket_id
+            )
+            .unwrap();
+
+            // Work on a snapshot to avoid borrowing conflicts while emitting
+            let items: Vec<(u64, Instr)> = self.pending_instrs.iter().copied().collect();
+            for (pc, instr) in items.into_iter() {
+                let pc_bucket = ((pc >> 2) & 255) as i32;
+                if pc_bucket == bucket_id {
+                    let _ = self.emit_instruction_block(pc, instr);
+                }
+            }
+
+            writeln!(&mut self.wat_code, "      end").unwrap();
+        }
+
+        // Loop back
         writeln!(&mut self.wat_code, "      ;; Loop back to check exit flag and execute next instruction").unwrap();
         writeln!(&mut self.wat_code, "      br $interpreter_loop").unwrap();
         writeln!(&mut self.wat_code, "    )").unwrap(); // Close loop
@@ -102,25 +126,25 @@ impl WasmEmitter {
 
     /// Emit a single RISC-V instruction as WAT
     pub fn emit_instruction(&mut self, pc: u64, instr: &Instruction) -> Result<(), String> {
-        // Wrap instruction in PC check - only execute if PC matches
+        self.pending_instrs.push((pc, instr.instr));
+        Ok(())
+    }
+
+    /// Emit one instruction (PC guard, translation, PC update, and loop back)
+    fn emit_instruction_block(&mut self, pc: u64, instr: Instr) -> Result<(), String> {
+        // PC guard and increment counter
         writeln!(
             &mut self.wat_code,
-            "      ;; PC=0x{:08x}: {:?}\n      global.get $pc\n      i64.const {}\n      i64.eq\n      if\n        ;; Increment execution counter\n        global.get $instr_count\n        i64.const 1\n        i64.add\n        global.set $instr_count",
-            pc, instr.instr, pc as i64
+            "        ;; PC=0x{:08x}: {:?}\n        global.get $pc\n        i64.const {}\n        i64.eq\n        if\n          global.get $instr_count\n          i64.const 1\n          i64.add\n          global.set $instr_count",
+            pc, instr, pc as i64
         )
         .unwrap();
 
-        // Watchdog: every 1,000,000 instructions print current PC
-        writeln!(
-            &mut self.wat_code,
-            "        ;; Watchdog: print PC every 8,192 instructions\n        global.get $instr_count\n        i64.const 8192\n        i64.rem_u\n        i64.eqz\n        if\n          global.get $pc\n          i32.wrap_i64\n          call $debug_print\n        end"
-        )
-        .unwrap();
+        // (debug watchdog removed for performance)
 
-        // Check if this instruction modifies PC (branches/jumps)
-        // Note: RV64 programs also use RV32I base instructions including jumps/branches
+        // Whether instruction modifies PC
         let modifies_pc = matches!(
-            &instr.instr,
+            instr,
             Instr::RV32(rv32) if matches!(rv32,
                 crate::frontend::instruction::RV32Instr::RV32I(i) if matches!(i,
                     crate::frontend::instruction::RV32I::JAL(_,_) |
@@ -135,50 +159,38 @@ impl WasmEmitter {
             )
         );
 
-        match &instr.instr {
+        match instr {
             Instr::RV32(rv32instr) => match rv32instr {
-                RV32Instr::RV32I(rv32i) => self.emit_rv32i(rv32i)?,
-                RV32Instr::RV32M(rv32m) => self.emit_rv32m(rv32m)?,
-                RV32Instr::RVV(rvv) => self.emit_rvv(rvv)?,
+                RV32Instr::RV32I(rv32i) => self.emit_rv32i(&rv32i)?,
+                RV32Instr::RV32M(rv32m) => self.emit_rv32m(&rv32m)?,
+                RV32Instr::RVV(rvv) => self.emit_rvv(&rvv)?,
+                RV32Instr::RVZcsr(z) => self.emit_zicsr(&z)?,
                 _ => {
-                    writeln!(&mut self.wat_code, "        ;; TODO: RV32 instruction {:?}", rv32instr)
-                        .unwrap();
+                    writeln!(&mut self.wat_code, "          ;; TODO: RV32 instruction {:?}", rv32instr).unwrap();
                 }
             },
             Instr::RV64(rv64instr) => match rv64instr {
-                RV64Instr::RV64I(rv64i) => self.emit_rv64i(rv64i)?,
-                RV64Instr::RV64M(rv64m) => self.emit_rv64m(rv64m)?,
-                RV64Instr::RV64V(rvv) => self.emit_rvv(rvv)?,
+                RV64Instr::RV64I(rv64i) => self.emit_rv64i(&rv64i)?,
+                RV64Instr::RV64M(rv64m) => self.emit_rv64m(&rv64m)?,
+                RV64Instr::RV64V(rvv) => self.emit_rvv(&rvv)?,
+                RV64Instr::RVZcsr(z) => self.emit_zicsr(&z)?,
                 _ => {
-                    writeln!(&mut self.wat_code, "        ;; TODO: RV64 instruction {:?}", rv64instr)
-                        .unwrap();
+                    writeln!(&mut self.wat_code, "          ;; TODO: RV64 instruction {:?}", rv64instr).unwrap();
                 }
             },
             Instr::NOP => {
-                writeln!(&mut self.wat_code, "        ;; NOP").unwrap();
+                writeln!(&mut self.wat_code, "          ;; NOP").unwrap();
             }
             _ => {
-                writeln!(&mut self.wat_code, "        ;; TODO: instruction {:?}", instr.instr)
-                    .unwrap();
+                writeln!(&mut self.wat_code, "          ;; TODO: instruction {:?}", instr).unwrap();
             }
         }
 
-        // Update PC to next instruction (PC += 4)
-        // Skip this for branch/jump instructions since they set PC themselves
         if !modifies_pc {
-            writeln!(
-                &mut self.wat_code,
-                "        global.get $pc\n        i64.const 4\n        i64.add\n        global.set $pc"
-            )
-            .unwrap();
+            writeln!(&mut self.wat_code, "          global.get $pc\n          i64.const 4\n          i64.add\n          global.set $pc").unwrap();
         }
-
-        // CRITICAL FIX: Immediately branch back to loop start after executing this instruction
-        // This prevents checking all remaining instructions unnecessarily
-        writeln!(&mut self.wat_code, "        br $interpreter_loop").unwrap();
-
-        // Close the if block
-        writeln!(&mut self.wat_code, "      end").unwrap();
+        writeln!(&mut self.wat_code, "          br $interpreter_loop").unwrap();
+        writeln!(&mut self.wat_code, "        end").unwrap();
 
         self.instr_count += 1;
         Ok(())
@@ -1263,6 +1275,117 @@ impl WasmEmitter {
                     instr
                 )
                 .unwrap();
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Emit Zicsr CSR operations via runtime helpers
+    fn emit_zicsr(&mut self, instr: &RVZcsr) -> Result<(), String> {
+        use crate::frontend::instruction::RVZcsr::*;
+
+        match instr {
+            // rd <- oldcsr; csr <- rs1
+            CSRRW(Rd(rd), Rs1(rs1), csr) => {
+                let rd_num = self.reg_num(rd)?;
+                let rs1_num = self.reg_num(rs1)?;
+                let csr_num = csr.value() as i32;
+                writeln!(
+                    &mut self.wat_code,
+                    "        ;; CSRRW rd, rs1, csr\n        i32.const {}\n        global.get $x{}\n        call $csr_read_write",
+                    csr_num, rs1_num
+                )
+                .unwrap();
+                if rd_num != 0 {
+                    writeln!(&mut self.wat_code, "        global.set $x{}", rd_num).unwrap();
+                } else {
+                    // Pop the returned value if x0 (discard)
+                    writeln!(&mut self.wat_code, "        drop").unwrap();
+                }
+            }
+            // rd <- oldcsr; if rs1 != x0 then csr <- csr | rs1
+            CSRRS(Rd(rd), Rs1(rs1), csr) => {
+                let rd_num = self.reg_num(rd)?;
+                let rs1_num = self.reg_num(rs1)?;
+                let csr_num = csr.value() as i32;
+                writeln!(
+                    &mut self.wat_code,
+                    "        ;; CSRRS rd, rs1, csr\n        i32.const {}\n        global.get $x{}\n        call $csr_read_set",
+                    csr_num, rs1_num
+                )
+                .unwrap();
+                if rd_num != 0 {
+                    writeln!(&mut self.wat_code, "        global.set $x{}", rd_num).unwrap();
+                } else {
+                    writeln!(&mut self.wat_code, "        drop").unwrap();
+                }
+            }
+            // rd <- oldcsr; if rs1 != x0 then csr <- csr & ~rs1
+            CSRRC(Rd(rd), Rs1(rs1), csr) => {
+                let rd_num = self.reg_num(rd)?;
+                let rs1_num = self.reg_num(rs1)?;
+                let csr_num = csr.value() as i32;
+                writeln!(
+                    &mut self.wat_code,
+                    "        ;; CSRRC rd, rs1, csr\n        i32.const {}\n        global.get $x{}\n        call $csr_read_clear",
+                    csr_num, rs1_num
+                )
+                .unwrap();
+                if rd_num != 0 {
+                    writeln!(&mut self.wat_code, "        global.set $x{}", rd_num).unwrap();
+                } else {
+                    writeln!(&mut self.wat_code, "        drop").unwrap();
+                }
+            }
+            // Immediate forms (uimm is 5-bit)
+            CSRRWI(Rd(rd), uimm, csr) => {
+                let rd_num = self.reg_num(rd)?;
+                let imm_val = uimm.value() as i64;
+                let csr_num = csr.value() as i32;
+                writeln!(
+                    &mut self.wat_code,
+                    "        ;; CSRRWI rd, uimm, csr\n        i32.const {}\n        i64.const {}\n        call $csr_read_write",
+                    csr_num, imm_val
+                )
+                .unwrap();
+                if rd_num != 0 {
+                    writeln!(&mut self.wat_code, "        global.set $x{}", rd_num).unwrap();
+                } else {
+                    writeln!(&mut self.wat_code, "        drop").unwrap();
+                }
+            }
+            CSRRSI(Rd(rd), uimm, csr) => {
+                let rd_num = self.reg_num(rd)?;
+                let imm_val = uimm.value() as i64;
+                let csr_num = csr.value() as i32;
+                writeln!(
+                    &mut self.wat_code,
+                    "        ;; CSRRSI rd, uimm, csr\n        i32.const {}\n        i64.const {}\n        call $csr_read_set",
+                    csr_num, imm_val
+                )
+                .unwrap();
+                if rd_num != 0 {
+                    writeln!(&mut self.wat_code, "        global.set $x{}", rd_num).unwrap();
+                } else {
+                    writeln!(&mut self.wat_code, "        drop").unwrap();
+                }
+            }
+            CSRRCI(Rd(rd), uimm, csr) => {
+                let rd_num = self.reg_num(rd)?;
+                let imm_val = uimm.value() as i64;
+                let csr_num = csr.value() as i32;
+                writeln!(
+                    &mut self.wat_code,
+                    "        ;; CSRRCI rd, uimm, csr\n        i32.const {}\n        i64.const {}\n        call $csr_read_clear",
+                    csr_num, imm_val
+                )
+                .unwrap();
+                if rd_num != 0 {
+                    writeln!(&mut self.wat_code, "        global.set $x{}", rd_num).unwrap();
+                } else {
+                    writeln!(&mut self.wat_code, "        drop").unwrap();
+                }
             }
         }
 

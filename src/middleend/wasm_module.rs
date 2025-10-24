@@ -177,6 +177,10 @@ impl WasmModule {
   ;; Import syscall handler
   (import "env" "syscall" (func $syscall (param i64 i64 i64 i64 i64 i64 i64) (result i64)))
   (import "env" "debug_print" (func $debug_print (param i32)))
+  ;; CSR runtime helpers
+  (import "env" "csr_read_write" (func $csr_read_write (param i32 i64) (result i64)))
+  (import "env" "csr_read_set" (func $csr_read_set (param i32 i64) (result i64)))
+  (import "env" "csr_read_clear" (func $csr_read_clear (param i32 i64) (result i64)))
 
   ;; Helper: Sign extend 32-bit to 64-bit
   (func $sign_extend_32 (param $val i32) (result i64)
@@ -514,7 +518,7 @@ impl WasmModule {
 
     /// Syscall handler - implements RISC-V syscalls
     fn syscall_handler(
-        mut env: FunctionEnvMut<Arc<Mutex<RiscVState>>>,
+        env: FunctionEnvMut<Arc<Mutex<RiscVState>>>,
         syscall_num: i64,
         arg1: i64,
         arg2: i64,

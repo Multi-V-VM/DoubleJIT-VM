@@ -6,7 +6,9 @@ use wasmer::sys::EngineBuilder;
 use wasmer_compiler_singlepass::Singlepass;
 use wasmer_wasix::{WasiEnvBuilder, WasiFunctionEnv};
 use std::sync::{Arc, Mutex};
+use std::collections::HashMap;
 use crate::codegen::optimizer::{WatOptimizer, OptLevel as WatOptLevel, OptStats};
+use crate::runtime::csr::{CsrManager, CsrAddress};
 
 /// Optimization level for WASM compilation
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -163,6 +165,18 @@ pub struct SyscallEnv {
     wasi_env: Option<Arc<Mutex<WasiFunctionEnv>>>,
     /// Program break (heap end) for brk syscall
     program_break: Arc<Mutex<u64>>,
+    /// Next base address for anonymous mmaps (simple bump allocator)
+    next_mmap_addr: Arc<Mutex<u64>>,
+    /// Minimal fake FD table for special devices
+    fds: Arc<Mutex<HashMap<i32, FakeFdType>>>,
+    /// Next FD to allocate
+    next_fd: Arc<Mutex<i32>>,
+}
+
+#[derive(Clone, Debug)]
+enum FakeFdType {
+    DevNull,
+    DevURandom,
 }
 
 /// Runtime environment for executing compiled RISC-V code
@@ -196,6 +210,9 @@ impl RiscVRuntime {
             set_exit_flag_func: None, // Will be set after instance creation
             wasi_env: None, // Will be set after WASI initialization
             program_break: Arc::new(Mutex::new(0x100000)), // Start heap at 1MB
+            next_mmap_addr: Arc::new(Mutex::new(0x0200_0000)), // 32MB
+            fds: Arc::new(Mutex::new(HashMap::new())),
+            next_fd: Arc::new(Mutex::new(100)),
         }));
 
         // Create function environment for host functions
@@ -213,6 +230,56 @@ impl RiscVRuntime {
                     &mut store,
                     &env,
                     Self::debug_print_handler
+                ),
+                // CSR runtime handlers
+                "csr_read_write" => Function::new_typed_with_env(
+                    &mut store,
+                    &env,
+                    |env: FunctionEnvMut<Arc<Mutex<SyscallEnv>>>, csr: i32, new_val: i64| -> i64 {
+                        let state_arc = {
+                            let sys = env.data().lock().unwrap();
+                            sys.state.clone()
+                        };
+                        let mut mgr = CsrManager::new(state_arc);
+                        if let Some(addr) = CsrAddress::from_u16(csr as u16) {
+                            mgr.read_write(addr, new_val as u64) as i64
+                        } else {
+                            // Unknown CSR: return 0 and ignore write
+                            0
+                        }
+                    }
+                ),
+                "csr_read_set" => Function::new_typed_with_env(
+                    &mut store,
+                    &env,
+                    |env: FunctionEnvMut<Arc<Mutex<SyscallEnv>>>, csr: i32, mask: i64| -> i64 {
+                        let state_arc = {
+                            let sys = env.data().lock().unwrap();
+                            sys.state.clone()
+                        };
+                        let mut mgr = CsrManager::new(state_arc);
+                        if let Some(addr) = CsrAddress::from_u16(csr as u16) {
+                            mgr.read_set(addr, mask as u64) as i64
+                        } else {
+                            0
+                        }
+                    }
+                ),
+                "csr_read_clear" => Function::new_typed_with_env(
+                    &mut store,
+                    &env,
+                    |env: FunctionEnvMut<Arc<Mutex<SyscallEnv>>>, csr: i32, mask: i64| -> i64 {
+                        let state_arc = {
+                            let sys = env.data().lock().unwrap();
+                            sys.state.clone()
+                        };
+                        let mut mgr = CsrManager::new(state_arc);
+                        if let Some(addr) = CsrAddress::from_u16(csr as u16) {
+                            mgr.read_clear(addr, mask as u64) as i64
+                        } else {
+                            0
+                        }
+                    }
                 ),
             },
             // Provide stub WASI functions to avoid needing full WASI initialization
@@ -745,18 +812,104 @@ impl RiscVRuntime {
             }
             98 => {
                 // futex(uaddr, futex_op, val, timeout, uaddr2, val3)
-                eprintln!("futex syscall (stubbed): op={}, addr=0x{:x}", arg2, arg1);
-                0 // success (ignore for now)
+                let uaddr = arg1 as u64;
+                let op = (arg2 as i32) & 0x7f; // strip private/clock flags
+                let val = arg3 as i32;
+                let memory = env.data().lock().unwrap().memory.clone();
+                if let Some(memory) = memory {
+                    let view = memory.view(&env);
+                    match op {
+                        0 => {
+                            // FUTEX_WAIT: if *uaddr != val -> -EAGAIN; else pretend success
+                            let mut tmp = [0u8; 4];
+                            if view.read(uaddr, &mut tmp).is_ok() {
+                                let cur = i32::from_le_bytes(tmp);
+                                if cur != val { return -11; } // -EAGAIN
+                                0
+                            } else { -14 } // -EFAULT
+                        }
+                        1 => {
+                            // FUTEX_WAKE: pretend we woke one waiter if val>0
+                            if val > 0 { 1 } else { 0 }
+                        }
+                        _ => {
+                            eprintln!("futex op {} not implemented; returning 0", op);
+                            0
+                        }
+                    }
+                } else { -14 }
             }
             99 => {
                 // set_robust_list
                 0 // success (ignore)
             }
             222 => {
-                // mmap
-                eprintln!("mmap syscall (stubbed): addr=0x{:x}, len=0x{:x}, prot={}, flags={}",
-                         arg1, arg2, arg3, arg4);
-                arg1 // return requested address
+                // mmap(addr, length, prot, flags, fd, offset)
+                let req_addr = arg1 as u64;
+                let length = arg2 as u64;
+                let flags = arg4 as u64;
+                let length_aligned = (length + 0xFFF) & !0xFFF;
+                let map_fixed = (flags & 0x10) != 0; // MAP_FIXED
+
+                if map_fixed && req_addr != 0 {
+                    return req_addr as i64;
+                }
+
+                // bump-allocate from next_mmap_addr
+                let (mmap_arc, mem_opt) = {
+                    let sys = env.data().lock().unwrap();
+                    (sys.next_mmap_addr.clone(), sys.memory.clone())
+                };
+                let mut base = mmap_arc.lock().unwrap();
+
+                // keep within memory if we can determine size
+                if let Some(memory) = mem_opt {
+                    let pages = memory.view(&env).size().0 as u64;
+                    let mem_bytes = pages * 65536;
+                    if *base + length_aligned > mem_bytes {
+                        // fall back to lower address if out of bounds
+                        *base = (*base & !0xFFFFF) % (mem_bytes.saturating_sub(length_aligned).max(65536));
+                    }
+                }
+
+                let ret = if req_addr == 0 { *base } else { req_addr };
+                if req_addr == 0 { *base = ret + length_aligned; }
+                eprintln!("DEBUG: mmap -> 0x{:x} (len 0x{:x})", ret, length_aligned);
+                ret as i64
+            }
+            215 => { 0 } // munmap(addr, len) no-op success
+            56 => {
+                // openat(dirfd, path, flags, mode)
+                let path_ptr = arg2 as u64;
+                let (memory_opt, fds_arc, next_fd_arc) = {
+                    let sys = env.data().lock().unwrap();
+                    (sys.memory.clone(), sys.fds.clone(), sys.next_fd.clone())
+                };
+                if let Some(memory) = memory_opt {
+                    let view = memory.view(&env);
+                    let mut s = Vec::new();
+                    for i in 0..4096u64 { if let Ok(b) = view.read_u8(path_ptr + i) { if b==0 {break;} s.push(b);} else {break;} }
+                    let path = String::from_utf8_lossy(&s);
+                    eprintln!("DEBUG: openat path='{}'", path);
+                    let mut fds = fds_arc.lock().unwrap();
+                    let mut next_fd = next_fd_arc.lock().unwrap();
+                    if path.ends_with("/dev/null") || path == "/dev/null" {
+                        let fd = *next_fd; *next_fd += 1; fds.insert(fd, FakeFdType::DevNull); fd as i64
+                    } else if path.ends_with("/dev/urandom") || path == "/dev/urandom" {
+                        let fd = *next_fd; *next_fd += 1; fds.insert(fd, FakeFdType::DevURandom); fd as i64
+                    } else { -2 }
+                } else { -14 }
+            }
+            79 => {
+                // newfstatat(dirfd, pathname, statbuf, flags)
+                let stat_addr = arg3 as u64;
+                let memory = env.data().lock().unwrap().memory.clone();
+                if let Some(memory) = memory {
+                    let view = memory.view(&env);
+                    let zero = [0u8; 128]; let _ = view.write(stat_addr, &zero);
+                    let mode: u32 = 0o100644; let _ = view.write(stat_addr + 16, &mode.to_le_bytes());
+                    0
+                } else { -14 }
             }
             261 => {
                 // prlimit64
