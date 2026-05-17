@@ -8,8 +8,18 @@ riscv binary [compile phase 1] wasm bytecode loaded [compile phase 2] native cod
 Parse the elf, map the page to a linear memory defined in WebAssembly, interpret code with code cache. Refer a lot from [ria-jit](https://github.com/ria-jit/ria-jit), [riscv-jit-emulator](https://github.com/programmerjake/riscv-jit-emulator), [ckb-vm](https://github.com/nervosnetwork/ckb-vm/) and [valheim](https://github.com/imkiva/valheim/)
 ### Middleend
 From riscv to WebAssembly. use the wasmtime currently, implement a LLVMOpaqueExecutionEngine/FastJIT like JIT interface and apply the runtime using (WASIX)[https://github.com/wasix-org/wasix-libc]. map the register to stack based WebAssembly Model.
+### eBPF compiler branch
+The `ebpf-compiler` branch adds a feature-gated RISC-V to eBPF path next to the WebAssembly path:
+
+```bash
+cargo run --features ebpf --example riscv-ebpf-compiler -- <path-to-riscv-elf> [output-ebpf.bin]
+```
+
+This path uses Aya-rs' `aya-obj` `bpf_insn` bindings and follows the verification discipline used in `../Movable/`: lowering emits explicit obligations, then a verifier checks that each accepted RISC-V instruction maps to exactly one eBPF instruction. Because eBPF is a two-address ISA with a small register file, the compiler rejects instructions that need extra moves, unsupported registers, sign-extension fixups, indirect control flow, or syscall ABI bridging.
+
+The eBPF ReJIT path commits replacements through `EbpfRejitCache`: it compiles a candidate block, verifies the one-to-one compilation proof, runs a conservative kernel-verifier preflight (exit, jump bounds, no unproved backward jumps, and no memory access without pointer provenance), then atomically replaces the cached block only if all checks pass.
 ## Backend
-From WebAssembly to x86. register guided optimzer and code cache optimzation, codegen
+From WebAssembly or eBPF to the native host backend. The compiler emits architecture-neutral eBPF bytecode; the final native backend may be x86, RISC-V, or another architecture supported by the selected runtime/JIT.
 ## Comparison of WebAssembly and RISC-V
 1. Code/Data Separation
 

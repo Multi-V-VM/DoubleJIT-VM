@@ -1,8 +1,8 @@
+use std::sync::{Arc, Mutex};
 use wasmer::{
     imports, wat2wasm, Function, FunctionEnv, FunctionEnvMut, Instance, Module, Store, Value,
     WasmPtr,
 };
-use std::sync::{Arc, Mutex};
 
 /// RISC-V register file mapped to WASM
 /// We use WASM linear memory and locals to represent RISC-V registers
@@ -34,7 +34,7 @@ pub struct CsrState {
     pub vstart: u64,
     pub vtype: u64,
     pub vl: u64,
-    pub vlenb: u64,  // VLEN/8 = 256 bytes
+    pub vlenb: u64, // VLEN/8 = 256 bytes
 
     /// Standard CSRs
     pub mstatus: u64,
@@ -98,6 +98,21 @@ impl WasmModule {
                     &env,
                     Self::debug_print_handler
                 ),
+                "csr_read_write" => Function::new_typed_with_env(
+                    &mut store,
+                    &env,
+                    Self::csr_read_write_handler
+                ),
+                "csr_read_set" => Function::new_typed_with_env(
+                    &mut store,
+                    &env,
+                    Self::csr_read_set_handler
+                ),
+                "csr_read_clear" => Function::new_typed_with_env(
+                    &mut store,
+                    &env,
+                    Self::csr_read_clear_handler
+                ),
             }
         };
 
@@ -118,6 +133,14 @@ impl WasmModule {
         // - Helper functions
         let wat = r#"
 (module
+  ;; Import syscall handler
+  (import "env" "syscall" (func $syscall (param i64 i64 i64 i64 i64 i64 i64) (result i64)))
+  (import "env" "debug_print" (func $debug_print (param i32)))
+  ;; CSR runtime helpers
+  (import "env" "csr_read_write" (func $csr_read_write (param i32 i64) (result i64)))
+  (import "env" "csr_read_set" (func $csr_read_set (param i32 i64) (result i64)))
+  (import "env" "csr_read_clear" (func $csr_read_clear (param i32 i64) (result i64)))
+
   ;; Memory: 256 pages initially (16MB), max 4096 pages (256MB) for SV39
   (memory (export "memory") 256 4096)
 
@@ -174,14 +197,6 @@ impl WasmModule {
   ;; We model v0..v31 each as 16 bytes (v128) for SIMD path
   (global $vreg_base (mut i32) (i32.const 65536))
 
-  ;; Import syscall handler
-  (import "env" "syscall" (func $syscall (param i64 i64 i64 i64 i64 i64 i64) (result i64)))
-  (import "env" "debug_print" (func $debug_print (param i32)))
-  ;; CSR runtime helpers
-  (import "env" "csr_read_write" (func $csr_read_write (param i32 i64) (result i64)))
-  (import "env" "csr_read_set" (func $csr_read_set (param i32 i64) (result i64)))
-  (import "env" "csr_read_clear" (func $csr_read_clear (param i32 i64) (result i64)))
-
   ;; Helper: Sign extend 32-bit to 64-bit
   (func $sign_extend_32 (param $val i32) (result i64)
     local.get $val
@@ -205,7 +220,7 @@ impl WasmModule {
     local.get $reg
     i32.const 0
     i32.eq
-    if (result i64)
+    if
       i64.const 0
       return
     end
@@ -538,7 +553,10 @@ impl WasmModule {
             }
             64 => {
                 // write
-                println!("RISC-V write(fd={}, buf=0x{:x}, count={})", arg1, arg2, arg3);
+                println!(
+                    "RISC-V write(fd={}, buf=0x{:x}, count={})",
+                    arg1, arg2, arg3
+                );
                 arg3 as i64 // return bytes written
             }
             63 => {
@@ -554,11 +572,69 @@ impl WasmModule {
     }
 
     /// Debug print handler
-    fn debug_print_handler(
-        _env: FunctionEnvMut<Arc<Mutex<RiscVState>>>,
-        val: i32,
-    ) {
+    fn debug_print_handler(_env: FunctionEnvMut<Arc<Mutex<RiscVState>>>, val: i32) {
         println!("DEBUG: 0x{:08x} ({})", val, val);
+    }
+
+    fn csr_read_write_handler(
+        env: FunctionEnvMut<Arc<Mutex<RiscVState>>>,
+        csr: i32,
+        new_val: i64,
+    ) -> i64 {
+        let mut state = env.data().lock().unwrap();
+        let old = Self::read_csr(&state.csr, csr);
+        Self::write_csr(&mut state.csr, csr, new_val as u64);
+        old as i64
+    }
+
+    fn csr_read_set_handler(
+        env: FunctionEnvMut<Arc<Mutex<RiscVState>>>,
+        csr: i32,
+        bits: i64,
+    ) -> i64 {
+        let mut state = env.data().lock().unwrap();
+        let old = Self::read_csr(&state.csr, csr);
+        Self::write_csr(&mut state.csr, csr, old | bits as u64);
+        old as i64
+    }
+
+    fn csr_read_clear_handler(
+        env: FunctionEnvMut<Arc<Mutex<RiscVState>>>,
+        csr: i32,
+        bits: i64,
+    ) -> i64 {
+        let mut state = env.data().lock().unwrap();
+        let old = Self::read_csr(&state.csr, csr);
+        Self::write_csr(&mut state.csr, csr, old & !(bits as u64));
+        old as i64
+    }
+
+    fn read_csr(csr_state: &CsrState, csr: i32) -> u64 {
+        match csr as u16 {
+            0x008 => csr_state.vstart,
+            0xC20 => csr_state.vl,
+            0xC21 => csr_state.vtype,
+            0xC22 => csr_state.vlenb,
+            0x300 => csr_state.mstatus,
+            0x305 => csr_state.mtvec,
+            0x341 => csr_state.mepc,
+            0x342 => csr_state.mcause,
+            _ => 0,
+        }
+    }
+
+    fn write_csr(csr_state: &mut CsrState, csr: i32, value: u64) {
+        match csr as u16 {
+            0x008 => csr_state.vstart = value,
+            0xC20 => csr_state.vl = value,
+            0xC21 => csr_state.vtype = value,
+            0xC22 => csr_state.vlenb = value,
+            0x300 => csr_state.mstatus = value,
+            0x305 => csr_state.mtvec = value,
+            0x341 => csr_state.mepc = value,
+            0x342 => csr_state.mcause = value,
+            _ => {}
+        }
     }
 
     /// Execute the main function
@@ -578,7 +654,11 @@ impl WasmModule {
     }
 
     /// Load data into WASM memory
-    pub fn load_memory(&mut self, offset: u32, data: &[u8]) -> Result<(), Box<dyn std::error::Error>> {
+    pub fn load_memory(
+        &mut self,
+        offset: u32,
+        data: &[u8],
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let memory = self.memory()?;
         let view = memory.view(&self.store);
 
@@ -590,7 +670,11 @@ impl WasmModule {
     }
 
     /// Read from WASM memory
-    pub fn read_memory(&self, offset: u32, len: usize) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    pub fn read_memory(
+        &self,
+        offset: u32,
+        len: usize,
+    ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
         let memory = self.memory()?;
         let view = memory.view(&self.store);
 

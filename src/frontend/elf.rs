@@ -1,3 +1,5 @@
+#[cfg(feature = "std")]
+use std::io;
 use std::{fmt, mem};
 use zero::{read, read_array, read_str, Pod};
 

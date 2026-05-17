@@ -1,14 +1,14 @@
+use crate::codegen::optimizer::{OptLevel as WatOptLevel, OptStats, WatOptimizer};
+use crate::runtime::csr::{CsrAddress, CsrManager};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use wasmer::sys::EngineBuilder;
 use wasmer::{
     imports, wat2wasm, Engine, Function, FunctionEnv, FunctionEnvMut, Instance, Module, Store,
     Value,
 };
-use wasmer::sys::EngineBuilder;
 use wasmer_compiler_singlepass::Singlepass;
 use wasmer_wasix::{WasiEnvBuilder, WasiFunctionEnv};
-use std::sync::{Arc, Mutex};
-use std::collections::HashMap;
-use crate::codegen::optimizer::{WatOptimizer, OptLevel as WatOptLevel, OptStats};
-use crate::runtime::csr::{CsrManager, CsrAddress};
 
 /// Optimization level for WASM compilation
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -206,9 +206,9 @@ impl RiscVRuntime {
         // Initialize program break at 0x100000 (1MB) - above .bss section
         let syscall_env = Arc::new(Mutex::new(SyscallEnv {
             state: state.clone(),
-            memory: None, // Will be set after instance creation
+            memory: None,             // Will be set after instance creation
             set_exit_flag_func: None, // Will be set after instance creation
-            wasi_env: None, // Will be set after WASI initialization
+            wasi_env: None,           // Will be set after WASI initialization
             program_break: Arc::new(Mutex::new(0x100000)), // Start heap at 1MB
             next_mmap_addr: Arc::new(Mutex::new(0x0200_0000)), // 32MB
             fds: Arc::new(Mutex::new(HashMap::new())),
@@ -371,7 +371,7 @@ impl RiscVRuntime {
                 "proc_exit" => Function::new_typed_with_env(
                     &mut store,
                     &env,
-                    |mut env: FunctionEnvMut<Arc<Mutex<SyscallEnv>>>, code: i32| {
+                    |mut env: FunctionEnvMut<Arc<Mutex<SyscallEnv>>>, code: i32| -> () {
                         // Properly handle exit - set the exit flag
                         let set_exit_flag_func = {
                             let syscall_env = env.data().lock().unwrap();
@@ -430,7 +430,9 @@ impl RiscVRuntime {
 
     /// Initialize WASM register globals from RiscVState
     pub fn init_registers(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        let set_reg = self.instance.exports.get_function("set_reg")?;
+        let Ok(set_reg) = self.instance.exports.get_function("set_reg") else {
+            return Ok(());
+        };
 
         // Copy all registers from RiscVState to WASM globals
         let reg_values: Vec<i64> = {
@@ -439,7 +441,8 @@ impl RiscVRuntime {
         };
 
         for (i, &val) in reg_values.iter().enumerate() {
-            if val != 0 {  // Only set non-zero registers for efficiency
+            if val != 0 {
+                // Only set non-zero registers for efficiency
                 set_reg.call(&mut self.store, &[Value::I32(i as i32), Value::I64(val)])?;
                 eprintln!("DEBUG: Initialized register x{} = 0x{:x}", i, val);
             }
@@ -474,7 +477,11 @@ impl RiscVRuntime {
     }
 
     /// Load data into WASM linear memory
-    pub fn load_memory(&mut self, offset: u32, data: &[u8]) -> Result<(), Box<dyn std::error::Error>> {
+    pub fn load_memory(
+        &mut self,
+        offset: u32,
+        data: &[u8],
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let memory = self.instance.exports.get_memory("memory")?;
         let view = memory.view(&mut self.store);
 
@@ -489,7 +496,11 @@ impl RiscVRuntime {
     }
 
     /// Read from WASM linear memory
-    pub fn read_memory(&self, offset: u32, len: usize) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    pub fn read_memory(
+        &self,
+        offset: u32,
+        len: usize,
+    ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
         let memory = self.instance.exports.get_memory("memory")?;
         let view = memory.view(&self.store);
 
@@ -533,8 +544,17 @@ impl RiscVRuntime {
         arg6: i64,
     ) -> i64 {
         // Debug: log every syscall with hex addresses for easier debugging
-        eprintln!("SYSCALL: num={} (0x{:x}), args=(0x{:x}, 0x{:x}, 0x{:x}, 0x{:x}, 0x{:x}, 0x{:x})",
-                 syscall_num, syscall_num as u64, arg1 as u64, arg2 as u64, arg3 as u64, arg4 as u64, arg5 as u64, arg6 as u64);
+        eprintln!(
+            "SYSCALL: num={} (0x{:x}), args=(0x{:x}, 0x{:x}, 0x{:x}, 0x{:x}, 0x{:x}, 0x{:x})",
+            syscall_num,
+            syscall_num as u64,
+            arg1 as u64,
+            arg2 as u64,
+            arg3 as u64,
+            arg4 as u64,
+            arg5 as u64,
+            arg6 as u64
+        );
 
         // Implement RISC-V Linux syscalls
         let result = match syscall_num {
@@ -557,7 +577,10 @@ impl RiscVRuntime {
                 let buf_addr = arg2 as u64;
                 let count = arg3 as usize;
 
-                eprintln!("DEBUG: write(fd={}, buf=0x{:x}, count={}) - calling WASI fd_write", fd, buf_addr, count);
+                eprintln!(
+                    "DEBUG: write(fd={}, buf=0x{:x}, count={}) - calling WASI fd_write",
+                    fd, buf_addr, count
+                );
 
                 // Get memory and WASI environment - clone them to avoid holding the lock
                 let (memory, wasi_env_opt) = {
@@ -577,7 +600,11 @@ impl RiscVRuntime {
                         }
                     }
 
-                    eprintln!("DEBUG: Read {} bytes from memory at 0x{:x}", buffer.len(), buf_addr);
+                    eprintln!(
+                        "DEBUG: Read {} bytes from memory at 0x{:x}",
+                        buffer.len(),
+                        buf_addr
+                    );
                     eprintln!("DEBUG: Data: {:?}", String::from_utf8_lossy(&buffer));
 
                     // Use WASI's file descriptor handling
@@ -665,17 +692,38 @@ impl RiscVRuntime {
                         let len_off = base_ptr_off + 8;
 
                         let mut tmp = [0u8; 8];
-                        if view.read(base_ptr_off, &mut tmp).is_err() { break; }
+                        if view.read(base_ptr_off, &mut tmp).is_err() {
+                            break;
+                        }
                         let base_ptr = u64::from_le_bytes(tmp);
-                        if view.read(len_off, &mut tmp).is_err() { break; }
+                        if view.read(len_off, &mut tmp).is_err() {
+                            break;
+                        }
                         let len = u64::from_le_bytes(tmp) as usize;
 
-                        if len == 0 { continue; }
+                        if len == 0 {
+                            continue;
+                        }
                         let mut buffer = vec![0u8; len];
-                        for j in 0..len { if let Ok(b) = view.read_u8(base_ptr + j as u64) { buffer[j] = b; } else { break; } }
+                        for j in 0..len {
+                            if let Ok(b) = view.read_u8(base_ptr + j as u64) {
+                                buffer[j] = b;
+                            } else {
+                                break;
+                            }
+                        }
 
-                        let res = match fd { 1 => std::io::stdout().write(&buffer), 2 => std::io::stderr().write(&buffer), _ => Ok(len) };
-                        match res { Ok(n) => { total_written += n; }, Err(_) => {} }
+                        let res = match fd {
+                            1 => std::io::stdout().write(&buffer),
+                            2 => std::io::stderr().write(&buffer),
+                            _ => Ok(len),
+                        };
+                        match res {
+                            Ok(n) => {
+                                total_written += n;
+                            }
+                            Err(_) => {}
+                        }
                     }
 
                     // Flush
@@ -700,12 +748,18 @@ impl RiscVRuntime {
 
                 if arg1 == 0 {
                     // brk(0) - return current program break
-                    eprintln!("DEBUG: brk(0) returning current break: 0x{:x}", *current_break);
+                    eprintln!(
+                        "DEBUG: brk(0) returning current break: 0x{:x}",
+                        *current_break
+                    );
                     *current_break as i64
                 } else {
                     // brk(addr) - set new program break
                     let new_break = arg1 as u64;
-                    eprintln!("DEBUG: brk(0x{:x}) - setting new break (was 0x{:x})", new_break, *current_break);
+                    eprintln!(
+                        "DEBUG: brk(0x{:x}) - setting new break (was 0x{:x})",
+                        new_break, *current_break
+                    );
 
                     // TODO: Check if new_break is within reasonable bounds
                     // For now, just accept it
@@ -767,7 +821,7 @@ impl RiscVRuntime {
                 // gettimeofday(tv, tz)
                 let tv_addr = arg1 as u64;
                 let memory = env.data().lock().unwrap().memory.clone();
-                if let Some(memory) = memory { 
+                if let Some(memory) = memory {
                     let view = memory.view(&env);
                     // Provide a monotonic-ish fake time
                     let secs: u64 = 1700000000;
@@ -775,7 +829,9 @@ impl RiscVRuntime {
                     let _ = view.write(tv_addr, &secs.to_le_bytes());
                     let _ = view.write(tv_addr + 8, &usec.to_le_bytes());
                     0
-                } else { -1 }
+                } else {
+                    -1
+                }
             }
             113 | 403 => {
                 // clock_gettime(clockid, timespec*)
@@ -788,7 +844,9 @@ impl RiscVRuntime {
                     let _ = view.write(ts_addr, &secs.to_le_bytes());
                     let _ = view.write(ts_addr + 8, &nsec.to_le_bytes());
                     0
-                } else { -1 }
+                } else {
+                    -1
+                }
             }
             174 => {
                 // getuid
@@ -824,20 +882,30 @@ impl RiscVRuntime {
                             let mut tmp = [0u8; 4];
                             if view.read(uaddr, &mut tmp).is_ok() {
                                 let cur = i32::from_le_bytes(tmp);
-                                if cur != val { return -11; } // -EAGAIN
+                                if cur != val {
+                                    return -11;
+                                } // -EAGAIN
                                 0
-                            } else { -14 } // -EFAULT
+                            } else {
+                                -14
+                            } // -EFAULT
                         }
                         1 => {
                             // FUTEX_WAKE: pretend we woke one waiter if val>0
-                            if val > 0 { 1 } else { 0 }
+                            if val > 0 {
+                                1
+                            } else {
+                                0
+                            }
                         }
                         _ => {
                             eprintln!("futex op {} not implemented; returning 0", op);
                             0
                         }
                     }
-                } else { -14 }
+                } else {
+                    -14
+                }
             }
             99 => {
                 // set_robust_list
@@ -868,16 +936,19 @@ impl RiscVRuntime {
                     let mem_bytes = pages * 65536;
                     if *base + length_aligned > mem_bytes {
                         // fall back to lower address if out of bounds
-                        *base = (*base & !0xFFFFF) % (mem_bytes.saturating_sub(length_aligned).max(65536));
+                        *base = (*base & !0xFFFFF)
+                            % (mem_bytes.saturating_sub(length_aligned).max(65536));
                     }
                 }
 
                 let ret = if req_addr == 0 { *base } else { req_addr };
-                if req_addr == 0 { *base = ret + length_aligned; }
+                if req_addr == 0 {
+                    *base = ret + length_aligned;
+                }
                 eprintln!("DEBUG: mmap -> 0x{:x} (len 0x{:x})", ret, length_aligned);
                 ret as i64
             }
-            215 => { 0 } // munmap(addr, len) no-op success
+            215 => 0, // munmap(addr, len) no-op success
             56 => {
                 // openat(dirfd, path, flags, mode)
                 let path_ptr = arg2 as u64;
@@ -888,17 +959,36 @@ impl RiscVRuntime {
                 if let Some(memory) = memory_opt {
                     let view = memory.view(&env);
                     let mut s = Vec::new();
-                    for i in 0..4096u64 { if let Ok(b) = view.read_u8(path_ptr + i) { if b==0 {break;} s.push(b);} else {break;} }
+                    for i in 0..4096u64 {
+                        if let Ok(b) = view.read_u8(path_ptr + i) {
+                            if b == 0 {
+                                break;
+                            }
+                            s.push(b);
+                        } else {
+                            break;
+                        }
+                    }
                     let path = String::from_utf8_lossy(&s);
                     eprintln!("DEBUG: openat path='{}'", path);
                     let mut fds = fds_arc.lock().unwrap();
                     let mut next_fd = next_fd_arc.lock().unwrap();
                     if path.ends_with("/dev/null") || path == "/dev/null" {
-                        let fd = *next_fd; *next_fd += 1; fds.insert(fd, FakeFdType::DevNull); fd as i64
+                        let fd = *next_fd;
+                        *next_fd += 1;
+                        fds.insert(fd, FakeFdType::DevNull);
+                        fd as i64
                     } else if path.ends_with("/dev/urandom") || path == "/dev/urandom" {
-                        let fd = *next_fd; *next_fd += 1; fds.insert(fd, FakeFdType::DevURandom); fd as i64
-                    } else { -2 }
-                } else { -14 }
+                        let fd = *next_fd;
+                        *next_fd += 1;
+                        fds.insert(fd, FakeFdType::DevURandom);
+                        fd as i64
+                    } else {
+                        -2
+                    }
+                } else {
+                    -14
+                }
             }
             79 => {
                 // newfstatat(dirfd, pathname, statbuf, flags)
@@ -906,10 +996,14 @@ impl RiscVRuntime {
                 let memory = env.data().lock().unwrap().memory.clone();
                 if let Some(memory) = memory {
                     let view = memory.view(&env);
-                    let zero = [0u8; 128]; let _ = view.write(stat_addr, &zero);
-                    let mode: u32 = 0o100644; let _ = view.write(stat_addr + 16, &mode.to_le_bytes());
+                    let zero = [0u8; 128];
+                    let _ = view.write(stat_addr, &zero);
+                    let mode: u32 = 0o100644;
+                    let _ = view.write(stat_addr + 16, &mode.to_le_bytes());
                     0
-                } else { -14 }
+                } else {
+                    -14
+                }
             }
             261 => {
                 // prlimit64
@@ -951,7 +1045,10 @@ impl RiscVRuntime {
                 // Critical for libc initialization (stack canaries, ASLR)
                 let buf_addr = arg1 as u64;
                 let buf_len = arg2 as usize;
-                eprintln!("DEBUG: getrandom syscall: buf=0x{:x}, len={}", buf_addr, buf_len);
+                eprintln!(
+                    "DEBUG: getrandom syscall: buf=0x{:x}, len={}",
+                    buf_addr, buf_len
+                );
 
                 let memory = env.data().lock().unwrap().memory.clone();
 
@@ -974,7 +1071,10 @@ impl RiscVRuntime {
             158 => {
                 // arch_prctl(code, addr) - x86-64 specific TLS setup
                 // code=0x1002 (ARCH_SET_FS), code=0x1003 (ARCH_GET_FS)
-                eprintln!("DEBUG: arch_prctl syscall: code=0x{:x}, addr=0x{:x}", arg1, arg2);
+                eprintln!(
+                    "DEBUG: arch_prctl syscall: code=0x{:x}, addr=0x{:x}",
+                    arg1, arg2
+                );
                 0 // Success (stub - WASM doesn't need TLS setup)
             }
             // rseq - different numbers on some archs
@@ -985,7 +1085,10 @@ impl RiscVRuntime {
             }
             89 => {
                 // readlink(path, buf, bufsiz)
-                eprintln!("DEBUG: readlink syscall: path=0x{:x}, buf=0x{:x}, size={}", arg1, arg2, arg3);
+                eprintln!(
+                    "DEBUG: readlink syscall: path=0x{:x}, buf=0x{:x}, size={}",
+                    arg1, arg2, arg3
+                );
                 -2 // ENOENT (file not found - we don't have a filesystem)
             }
             21 => {
@@ -1032,8 +1135,10 @@ impl RiscVRuntime {
             134 => {
                 // rt_sigaction(signum, act, oldact, sigsetsize)
                 // Signal handler registration
-                eprintln!("DEBUG: rt_sigaction syscall: sig={}, act=0x{:x}, oldact=0x{:x}",
-                    arg1, arg2, arg3);
+                eprintln!(
+                    "DEBUG: rt_sigaction syscall: sig={}, act=0x{:x}, oldact=0x{:x}",
+                    arg1, arg2, arg3
+                );
                 0 // Success (stub)
             }
             13 => {
@@ -1097,14 +1202,22 @@ impl RiscVRuntime {
             _ => {
                 // Check if syscall number looks like garbage (way too high)
                 if syscall_num > 500 || syscall_num < 0 {
-                    eprintln!("ERROR: Invalid syscall number {} - this is likely a bug!", syscall_num);
+                    eprintln!(
+                        "ERROR: Invalid syscall number {} - this is likely a bug!",
+                        syscall_num
+                    );
                     eprintln!("  This usually means x17 (a7) register contains garbage");
-                    eprintln!("  Args: {}, {}, {}, {}, {}, {}", arg1, arg2, arg3, arg4, arg5, arg6);
+                    eprintln!(
+                        "  Args: {}, {}, {}, {}, {}, {}",
+                        arg1, arg2, arg3, arg4, arg5, arg6
+                    );
                     // Return error to help debug
                     -38 // ENOSYS
                 } else {
-                    eprintln!("⚠️  UNKNOWN SYSCALL {}: args=({}, {}, {}, {}, {}, {}) - returning ENOSYS",
-                             syscall_num, arg1, arg2, arg3, arg4, arg5, arg6);
+                    eprintln!(
+                        "⚠️  UNKNOWN SYSCALL {}: args=({}, {}, {}, {}, {}, {}) - returning ENOSYS",
+                        syscall_num, arg1, arg2, arg3, arg4, arg5, arg6
+                    );
                     -38 // ENOSYS
                 }
             }
@@ -1112,7 +1225,19 @@ impl RiscVRuntime {
 
         // Log the result of the syscall
         if result < 0 {
-            eprintln!("  → returned ERROR: {} ({})", result, if result == -38 { "ENOSYS" } else if result == -1 { "EFAULT" } else if result == -2 { "ENOENT" } else { "?" });
+            eprintln!(
+                "  → returned ERROR: {} ({})",
+                result,
+                if result == -38 {
+                    "ENOSYS"
+                } else if result == -1 {
+                    "EFAULT"
+                } else if result == -2 {
+                    "ENOENT"
+                } else {
+                    "?"
+                }
+            );
         } else {
             eprintln!("  → returned: {}", result);
         }
@@ -1121,10 +1246,7 @@ impl RiscVRuntime {
     }
 
     /// Debug print handler (called from native code)
-    fn debug_print_handler(
-        _env: FunctionEnvMut<Arc<Mutex<SyscallEnv>>>,
-        val: i32,
-    ) {
+    fn debug_print_handler(_env: FunctionEnvMut<Arc<Mutex<SyscallEnv>>>, val: i32) {
         println!("DEBUG: 0x{:08x} ({})", val, val);
     }
 }
@@ -1195,7 +1317,6 @@ impl RuntimeBuilder {
         mut store: Store,
         state: Arc<Mutex<crate::middleend::RiscVState>>,
     ) -> Result<RiscVRuntime, Box<dyn std::error::Error>> {
-
         // Create runtime with compiled native code
         RiscVRuntime::new(store, module, state)
     }
@@ -1219,7 +1340,7 @@ mod tests {
 
     #[test]
     fn test_compile_simple_wat() {
-        let builder = WasmBuilder::new().unwrap();
+        let mut builder = WasmBuilder::new().unwrap();
 
         let wat = r#"
         (module
@@ -1238,7 +1359,7 @@ mod tests {
 
     #[test]
     fn test_compile_and_execute() {
-        let builder = RuntimeBuilder::new().unwrap();
+        let mut builder = RuntimeBuilder::new().unwrap();
         let state = Arc::new(Mutex::new(crate::middleend::RiscVState::default()));
 
         let wat = r#"
@@ -1256,7 +1377,7 @@ mod tests {
 
     #[test]
     fn test_memory_operations() {
-        let builder = RuntimeBuilder::new().unwrap();
+        let mut builder = RuntimeBuilder::new().unwrap();
         let state = Arc::new(Mutex::new(crate::middleend::RiscVState::default()));
 
         let wat = r#"

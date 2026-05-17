@@ -139,11 +139,12 @@ mod test {
     use super::*;
     #[test]
     fn test_parse_naive_binary() {
-        Binary::parse(include_bytes!(concat!(
+        let bytes = include_bytes!(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/test_binaries/test1"
-        )))
-        .unwrap();
+        ))
+        .to_vec();
+        Binary::parse(&bytes).unwrap();
         unsafe { assert_eq!(BIT_LENGTH, 1) }
     }
 }

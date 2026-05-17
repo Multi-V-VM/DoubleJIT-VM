@@ -2476,7 +2476,7 @@ mod tests {
             instr.instr,
             Instr::RV32(RV32Instr::RV32I(RV32I::AUIPC(
                 Rd(Reg::X(Xx(12))),
-                Imm32::<31, 12>::from(0)
+                Imm32::<31, 12>::from(12288)
             )))
         );
     }

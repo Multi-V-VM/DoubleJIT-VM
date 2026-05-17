@@ -1,0 +1,28 @@
+# RISC-V Binary Benchmarks
+
+- runner: `/root/doublejit-vm/target/release/examples/doublejit-runner`
+- runs per binary: `1`
+- timeout seconds: `10`
+
+- max log bytes: `65536`
+
+| Binary | Run | Status | Program Exit | Wall ms | Instructions | Log |
+| --- | ---: | --- | ---: | ---: | ---: | --- |
+| `test_binaries/add_test/add_test` | 1 | timeout | NA | 10029 | NA | `bench-results/logs/test_binaries__add_test__add_test.run1.log` |
+| `test_binaries/archive/assembly_arithmetic` | 1 | ok | 0 | 109 | 6 | `bench-results/logs/test_binaries__archive__assembly_arithmetic.run1.log` |
+| `test_binaries/archive/assembly_controlflow` | 1 | ok | 0 | 109 | 96 | `bench-results/logs/test_binaries__archive__assembly_controlflow.run1.log` |
+| `test_binaries/archive/assembly_hello_world` | 1 | ok | 0 | 109 | 9 | `bench-results/logs/test_binaries__archive__assembly_hello_world.run1.log` |
+| `test_binaries/archive/compiled_hello_world` | 1 | fail | NA | 109 | 327684 | `bench-results/logs/test_binaries__archive__compiled_hello_world.run1.log` |
+| `test_binaries/archive/hello_wordArch` | 1 | timeout | NA | 10032 | NA | `bench-results/logs/test_binaries__archive__hello_wordArch.run1.log` |
+| `test_binaries/archive/io_test` | 1 | timeout | NA | 10034 | NA | `bench-results/logs/test_binaries__archive__io_test.run1.log` |
+| `test_binaries/arithmetic_test/arithm` | 1 | fail | NA | 107 | 257476 | `bench-results/logs/test_binaries__arithmetic_test__arithm.run1.log` |
+| `test_binaries/benchmarks/mandelbrot-riscv` | 1 | timeout | NA | 10030 | NA | `bench-results/logs/test_binaries__benchmarks__mandelbrot-riscv.run1.log` |
+| `test_binaries/conformance/risc` | 1 | timeout | NA | 10032 | NA | `bench-results/logs/test_binaries__conformance__risc.run1.log` |
+| `test_binaries/float_test/f_arithm_test` | 1 | timeout | NA | 10032 | NA | `bench-results/logs/test_binaries__float_test__f_arithm_test.run1.log` |
+| `test_binaries/float_test/f_arithm_test_stdlib` | 1 | timeout | NA | 10031 | NA | `bench-results/logs/test_binaries__float_test__f_arithm_test_stdlib.run1.log` |
+| `test_binaries/float_test/float_test` | 1 | timeout | NA | 10034 | NA | `bench-results/logs/test_binaries__float_test__float_test.run1.log` |
+| `test_binaries/gzip_test/gzip` | 1 | timeout | NA | 10037 | NA | `bench-results/logs/test_binaries__gzip_test__gzip.run1.log` |
+| `test_binaries/gzip_test/gzip-float` | 1 | timeout | NA | 10038 | NA | `bench-results/logs/test_binaries__gzip_test__gzip-float.run1.log` |
+| `test_binaries/lazy_replace_example/lazy_replace` | 1 | ok | 0 | 109 | 8 | `bench-results/logs/test_binaries__lazy_replace_example__lazy_replace.run1.log` |
+| `test_binaries/sort_example/sort` | 1 | timeout | NA | 10031 | NA | `bench-results/logs/test_binaries__sort_example__sort.run1.log` |
+| `test_binaries/test1` | 1 | timeout | NA | 10017 | NA | `bench-results/logs/test_binaries__test1.run1.log` |
