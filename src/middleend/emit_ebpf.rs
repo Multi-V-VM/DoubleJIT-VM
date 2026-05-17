@@ -14,8 +14,8 @@ use std::error::Error;
 use std::fmt;
 
 use crate::frontend::instruction::{
-    Imm32, Instr, Instruction, RV32Instr, RV64Instr, Rd, Reg, Rs1, Rs2, Shamt, RV32I, RV32M, RV64I,
-    RV64M,
+    Imm32, Instr, Instruction, RV32Instr, RV64Instr, Rd, Reg, Rs1, Rs2, Rs3, Shamt, RV32I, RV32M,
+    RV64I, RV64M, RVV, VM,
 };
 
 const BPF_X: u32 = 0x08;
@@ -42,9 +42,11 @@ const BPF_JGE: u32 = 0x30;
 const BPF_JNE: u32 = 0x50;
 const BPF_JSGT: u32 = 0x60;
 const BPF_JSGE: u32 = 0x70;
+const BPF_CALL: u32 = 0x80;
 const BPF_EXIT: u32 = 0x90;
 
 const DEFAULT_KERNEL_MAX_INSNS: usize = 1_000_000;
+const RVV_HELPER_BASE: u32 = 0x4000_0000;
 
 /// A fully verified eBPF program backed by Aya's `bpf_insn` bindings.
 #[derive(Debug, Clone)]
@@ -398,14 +400,222 @@ fn lower_instr(
         Instr::NOP => Ok(noop("nop")),
         Instr::RV32(RV32Instr::RV32I(inst)) => lower_rv32i(pc, index, instr, inst, pc_to_index),
         Instr::RV32(RV32Instr::RV32M(inst)) => lower_rv32m(pc, instr, inst),
+        Instr::RV32(RV32Instr::RVV(inst)) => lower_rvv(pc, instr, inst),
         Instr::RV64(RV64Instr::RV64I(inst)) => lower_rv64i(pc, instr, inst),
         Instr::RV64(RV64Instr::RV64M(inst)) => lower_rv64m(pc, instr, inst),
+        Instr::RV64(RV64Instr::RV64V(inst)) => lower_rvv(pc, instr, inst),
         _ => unsupported(
             pc,
             instr,
-            "only RV32I/RV32M/RV64I/RV64M scalar subset is supported",
+            "only RV32I/RV32M/RV64I/RV64M scalar subset and RVV helper-call subset are supported",
         ),
     }
+}
+
+fn lower_rvv(pc: u64, source: Instr, instr: RVV) -> Result<Lowered, EbpfCompileError> {
+    use RVV::*;
+
+    match instr {
+        VSETVLI(Rd(rd), Rs1(rs1), vtype) => {
+            let rd = x_reg(pc, source, &rd)?;
+            let rs1 = x_reg(pc, source, &rs1)?;
+            Ok(rvv_helper_lowered(
+                rvv_helper_vsetvli(0x01, rd, rs1, vtype.decode()),
+                "rvv.vsetvli.helper_call",
+                "helper sets vl/vtype from scalar AVL and encoded vtype",
+            ))
+        }
+        VSETIVLI(Rd(rd), imm) => {
+            let rd = x_reg(pc, source, &rd)?;
+            Ok(rvv_helper_lowered(
+                rvv_helper_vsetivli(0x02, rd, imm.decode()),
+                "rvv.vsetivli.helper_call",
+                "helper sets vl/vtype from immediate AVL and encoded vtype",
+            ))
+        }
+        VSETVL(Rd(rd), Rs1(rs1), Rs2(rs2)) => {
+            let rd = x_reg(pc, source, &rd)?;
+            let rs1 = x_reg(pc, source, &rs1)?;
+            let rs2 = x_reg(pc, source, &rs2)?;
+            Ok(rvv_helper_lowered(
+                rvv_helper3(0x03, rd, rs1, rs2, 0, 0),
+                "rvv.vsetvl.helper_call",
+                "helper sets vl/vtype from scalar AVL and scalar vtype register",
+            ))
+        }
+        VLE8_V(Rd(vd), Rs1(base), VM(mask)) => lower_rvv_load(pc, source, 0x08, vd, base, mask),
+        VLE16_V(Rd(vd), Rs1(base), VM(mask)) => lower_rvv_load(pc, source, 0x09, vd, base, mask),
+        VLE32_V(Rd(vd), Rs1(base), VM(mask)) => lower_rvv_load(pc, source, 0x0a, vd, base, mask),
+        VLE64_V(Rd(vd), Rs1(base), VM(mask)) => lower_rvv_load(pc, source, 0x0b, vd, base, mask),
+        VSE8_V(Rs3(vs3), Rs1(base), VM(mask)) => lower_rvv_store(pc, source, 0x0c, vs3, base, mask),
+        VSE16_V(Rs3(vs3), Rs1(base), VM(mask)) => lower_rvv_store(pc, source, 0x0d, vs3, base, mask),
+        VSE32_V(Rs3(vs3), Rs1(base), VM(mask)) => lower_rvv_store(pc, source, 0x0e, vs3, base, mask),
+        VSE64_V(Rs3(vs3), Rs1(base), VM(mask)) => lower_rvv_store(pc, source, 0x0f, vs3, base, mask),
+
+        VADD_VV(Rd(vd), Rs1(vs1), Rs2(vs2), VM(mask)) => {
+            lower_rvv_vv(pc, source, 0x10, vd, vs1, vs2, mask, "rvv.vadd_vv.helper_call", "helper executes RVV vadd.vv")
+        }
+        VSUB_VV(Rd(vd), Rs1(vs1), Rs2(vs2), VM(mask)) => {
+            lower_rvv_vv(pc, source, 0x11, vd, vs1, vs2, mask, "rvv.vsub_vv.helper_call", "helper executes RVV vsub.vv")
+        }
+        VAND_VV(Rd(vd), Rs1(vs1), Rs2(vs2), VM(mask)) => {
+            lower_rvv_vv(pc, source, 0x12, vd, vs1, vs2, mask, "rvv.vand_vv.helper_call", "helper executes RVV vand.vv")
+        }
+        VOR_VV(Rd(vd), Rs1(vs1), Rs2(vs2), VM(mask)) => {
+            lower_rvv_vv(pc, source, 0x13, vd, vs1, vs2, mask, "rvv.vor_vv.helper_call", "helper executes RVV vor.vv")
+        }
+        VXOR_VV(Rd(vd), Rs1(vs1), Rs2(vs2), VM(mask)) => {
+            lower_rvv_vv(pc, source, 0x14, vd, vs1, vs2, mask, "rvv.vxor_vv.helper_call", "helper executes RVV vxor.vv")
+        }
+        VMUL_VV(Rd(vd), Rs1(vs1), Rs2(vs2), VM(mask)) => {
+            lower_rvv_vv(pc, source, 0x15, vd, vs1, vs2, mask, "rvv.vmul_vv.helper_call", "helper executes RVV vmul.vv")
+        }
+
+        VADD_VX(Rd(vd), Rs1(vs1), Rs2(rs2), VM(mask)) => {
+            lower_rvv_vx(pc, source, 0x18, vd, vs1, rs2, mask, "rvv.vadd_vx.helper_call", "helper executes RVV vadd.vx")
+        }
+        VSUB_VX(Rd(vd), Rs1(vs1), Rs2(rs2), VM(mask)) => {
+            lower_rvv_vx(pc, source, 0x19, vd, vs1, rs2, mask, "rvv.vsub_vx.helper_call", "helper executes RVV vsub.vx")
+        }
+        VRSUB_VX(Rd(vd), Rs1(vs1), Rs2(rs2), VM(mask)) => {
+            lower_rvv_vx(pc, source, 0x1a, vd, vs1, rs2, mask, "rvv.vrsub_vx.helper_call", "helper executes RVV vrsub.vx")
+        }
+        VAND_VX(Rd(vd), Rs1(vs1), Rs2(rs2), VM(mask)) => {
+            lower_rvv_vx(pc, source, 0x1b, vd, vs1, rs2, mask, "rvv.vand_vx.helper_call", "helper executes RVV vand.vx")
+        }
+        VOR_VX(Rd(vd), Rs1(vs1), Rs2(rs2), VM(mask)) => {
+            lower_rvv_vx(pc, source, 0x1c, vd, vs1, rs2, mask, "rvv.vor_vx.helper_call", "helper executes RVV vor.vx")
+        }
+        VXOR_VX(Rd(vd), Rs1(vs1), Rs2(rs2), VM(mask)) => {
+            lower_rvv_vx(pc, source, 0x1d, vd, vs1, rs2, mask, "rvv.vxor_vx.helper_call", "helper executes RVV vxor.vx")
+        }
+        VMUL_VX(Rd(vd), Rs1(vs1), Rs2(rs2), VM(mask)) => {
+            lower_rvv_vx(pc, source, 0x1e, vd, vs1, rs2, mask, "rvv.vmul_vx.helper_call", "helper executes RVV vmul.vx")
+        }
+
+        _ => unsupported(
+            pc,
+            source,
+            "RVV helper-call lowering currently supports vsetvl*, unit-stride 8/16/32/64 load/store, and integer add/sub/logic/mul vv/vx ops",
+        ),
+    }
+}
+
+fn lower_rvv_load(
+    pc: u64,
+    source: Instr,
+    op: u8,
+    vd: Reg,
+    base: Reg,
+    mask: bool,
+) -> Result<Lowered, EbpfCompileError> {
+    let vd = v_reg(pc, source, &vd)?;
+    let base = x_reg(pc, source, &base)?;
+    Ok(rvv_helper_lowered(
+        rvv_helper3(op, vd, base, 0, 0, u8::from(mask)),
+        "rvv.unit_stride_load.helper_call",
+        "helper executes RVV unit-stride vector load",
+    ))
+}
+
+fn lower_rvv_store(
+    pc: u64,
+    source: Instr,
+    op: u8,
+    vs3: Reg,
+    base: Reg,
+    mask: bool,
+) -> Result<Lowered, EbpfCompileError> {
+    let vs3 = v_reg(pc, source, &vs3)?;
+    let base = x_reg(pc, source, &base)?;
+    Ok(rvv_helper_lowered(
+        rvv_helper3(op, vs3, base, 0, 0, u8::from(mask)),
+        "rvv.unit_stride_store.helper_call",
+        "helper executes RVV unit-stride vector store",
+    ))
+}
+
+fn lower_rvv_vv(
+    pc: u64,
+    source: Instr,
+    op: u8,
+    vd: Reg,
+    vs1: Reg,
+    vs2: Reg,
+    mask: bool,
+    rule: &'static str,
+    effect: &'static str,
+) -> Result<Lowered, EbpfCompileError> {
+    let vd = v_reg(pc, source, &vd)?;
+    let vs1 = v_reg(pc, source, &vs1)?;
+    let vs2 = v_reg(pc, source, &vs2)?;
+    Ok(rvv_helper_lowered(
+        rvv_helper3(op, vd, vs1, vs2, 0, u8::from(mask)),
+        rule,
+        effect,
+    ))
+}
+
+fn lower_rvv_vx(
+    pc: u64,
+    source: Instr,
+    op: u8,
+    vd: Reg,
+    vs1: Reg,
+    rs2: Reg,
+    mask: bool,
+    rule: &'static str,
+    effect: &'static str,
+) -> Result<Lowered, EbpfCompileError> {
+    let vd = v_reg(pc, source, &vd)?;
+    let vs1 = v_reg(pc, source, &vs1)?;
+    let rs2 = x_reg(pc, source, &rs2)?;
+    Ok(rvv_helper_lowered(
+        rvv_helper3(op, vd, vs1, rs2, 0, u8::from(mask)),
+        rule,
+        effect,
+    ))
+}
+
+fn rvv_helper_lowered(helper_id: i32, rule: &'static str, effect: &'static str) -> Lowered {
+    lowered(
+        helper_call(helper_id),
+        rule,
+        vec![
+            "eBPF helper-call descriptor encodes the exact RVV opcode and operands",
+            "RVV helper ABI is available to the eBPF runtime",
+            "helper implementation is obligated to match the decoded RVV instruction semantics",
+        ],
+        effect,
+    )
+}
+
+fn rvv_helper_vsetvli(op: u8, rd: u8, rs1: u8, vtype: u32) -> i32 {
+    let encoded = RVV_HELPER_BASE
+        | (u32::from(op & 0x1f) << 25)
+        | (u32::from(rd) << 20)
+        | (u32::from(rs1) << 15)
+        | (vtype & 0x7fff);
+    encoded as i32
+}
+
+fn rvv_helper_vsetivli(op: u8, rd: u8, encoded_imm: u32) -> i32 {
+    let encoded = RVV_HELPER_BASE
+        | (u32::from(op & 0x1f) << 25)
+        | (u32::from(rd) << 20)
+        | (encoded_imm & 0x000f_ffff);
+    encoded as i32
+}
+
+fn rvv_helper3(op: u8, a: u8, b: u8, c: u8, imm5: u8, aux4: u8) -> i32 {
+    let encoded = RVV_HELPER_BASE
+        | (u32::from(op & 0x1f) << 25)
+        | ((u32::from(aux4) & 0x0f) << 21)
+        | (u32::from(a) << 16)
+        | (u32::from(b) << 11)
+        | (u32::from(c) << 6)
+        | (u32::from(imm5) & 0x1f);
+    encoded as i32
 }
 
 fn lower_rv32i(
@@ -1049,6 +1259,17 @@ fn x_reg(pc: u64, source: Instr, reg: &Reg) -> Result<u8, EbpfCompileError> {
     }
 }
 
+fn v_reg(pc: u64, source: Instr, reg: &Reg) -> Result<u8, EbpfCompileError> {
+    match reg {
+        Reg::V(xx) => Ok(xx.value() as u8),
+        _ => unsupported(
+            pc,
+            source,
+            "only vector V registers map to RVV eBPF helpers",
+        ),
+    }
+}
+
 fn write_bpf_reg(pc: u64, source: Instr, reg: u8) -> Result<Option<u8>, EbpfCompileError> {
     if reg == 0 {
         Ok(None)
@@ -1131,6 +1352,10 @@ fn jmp_reg(op: u32, dst: u8, src: u8, off: i16) -> bpf_insn {
 
 fn jmp_imm(op: u32, dst: u8, off: i16, imm: i32) -> bpf_insn {
     insn(BPF_JMP | op | BPF_K, dst, 0, off, imm)
+}
+
+fn helper_call(helper_id: i32) -> bpf_insn {
+    insn(BPF_JMP | BPF_CALL, 0, 0, 0, helper_id)
 }
 
 fn jmp_exit() -> bpf_insn {
@@ -1247,6 +1472,12 @@ fn verify_kernel_properties(
                         }
                     }
                 }
+                BPF_CALL => {
+                    jump_instructions += 1;
+                    if ins.imm <= 0 {
+                        return verification_err("eBPF helper call has no helper descriptor");
+                    }
+                }
                 _ => return verification_err("unknown eBPF jump op"),
             }
         }
@@ -1322,9 +1553,20 @@ fn verify_insn_shape(ins: &bpf_insn) -> Result<(), EbpfCompileError> {
             let op = code & 0xf0;
             if !matches!(
                 op,
-                BPF_JA | BPF_JEQ | BPF_JGT | BPF_JGE | BPF_JNE | BPF_JSGT | BPF_JSGE | BPF_EXIT
+                BPF_JA
+                    | BPF_JEQ
+                    | BPF_JGT
+                    | BPF_JGE
+                    | BPF_JNE
+                    | BPF_JSGT
+                    | BPF_JSGE
+                    | BPF_CALL
+                    | BPF_EXIT
             ) {
                 return verification_err("unknown eBPF jump op");
+            }
+            if op == BPF_CALL && (dst != 0 || src != 0 || ins.off != 0 || ins.imm <= 0) {
+                return verification_err("malformed eBPF helper call");
             }
         }
         _ => return verification_err("unsupported eBPF instruction class"),
@@ -1407,10 +1649,14 @@ fn verification_err<T>(reason: &str) -> Result<T, EbpfCompileError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::frontend::instruction::{Xx, RV32I};
+    use crate::frontend::instruction::{Xx, RV32I, RVV};
 
     fn x(n: u32) -> Reg {
         Reg::X(Xx::new(n))
+    }
+
+    fn v(n: u32) -> Reg {
+        Reg::V(Xx::new(n))
     }
 
     fn compile_one(instr: Instr) -> EbpfProgram {
@@ -1476,6 +1722,60 @@ mod tests {
             bytes,
             vec![(BPF_ALU64 | BPF_ADD | BPF_K) as u8, 1, 0, 0, 7, 0, 0, 0]
         );
+    }
+
+    #[test]
+    fn rvv_vadd_maps_to_one_helper_call_with_proof() {
+        let instr = Instr::RV64(RV64Instr::RV64V(RVV::VADD_VV(
+            Rd(v(1)),
+            Rs1(v(1)),
+            Rs2(v(2)),
+            VM(true),
+        )));
+        let program = compile_one(instr);
+        let report = program.verify().unwrap();
+        assert!(report.one_to_one);
+        assert_eq!(program.instructions().len(), 1);
+
+        let ins = program.instructions()[0];
+        assert_eq!(u32::from(ins.code), BPF_JMP | BPF_CALL);
+        assert_eq!(ins.dst_reg(), 0);
+        assert_eq!(ins.src_reg(), 0);
+        assert!(ins.imm > 0);
+
+        let proof = &program.proof_obligations()[0];
+        assert_eq!(proof.source, instr);
+        assert_eq!(proof.target_index, 0);
+        assert_eq!(proof.target_len, 1);
+        assert_eq!(proof.rule, "rvv.vadd_vv.helper_call");
+        assert!(proof
+            .preconditions
+            .contains(&"eBPF helper-call descriptor encodes the exact RVV opcode and operands"));
+        assert_eq!(proof.effect, "helper executes RVV vadd.vv");
+    }
+
+    #[test]
+    fn rvv_helper_call_passes_rejit_compile_time_preflight() {
+        let instr = Instr::RV64(RV64Instr::RV64V(RVV::VADD_VV(
+            Rd(v(1)),
+            Rs1(v(1)),
+            Rs2(v(2)),
+            VM(true),
+        )));
+        let program = EbpfCompiler::new()
+            .with_exit_trailer(true)
+            .compile_entries(&[(0x1000, instr)])
+            .unwrap();
+
+        let report = program.verify_compile_time().unwrap();
+        assert!(report.compilation.one_to_one);
+        assert_eq!(report.compilation.source_instructions, 1);
+        assert_eq!(report.compilation.mapped_instructions, 1);
+        assert_eq!(report.compilation.trailer_instructions, 2);
+        assert_eq!(report.kernel.jump_instructions, 1);
+        assert_eq!(report.kernel.exit_instructions, 1);
+        assert_eq!(report.kernel.memory_instructions, 0);
+        assert_eq!(report.kernel.backward_jumps, 0);
     }
 
     #[test]

@@ -40,5 +40,9 @@ name = "perf_demo"
 [[example]]
 name = "optimizer_demo"
 
+[[bench]]
+name = "rvv_ebpf_avx512"
+harness = false
+
 [package.metadata.docs.rs]
 all-features = true

@@ -194,7 +194,7 @@ impl WasmModule {
   (global $entry_pc (mut i64) (i64.const 0))
 
   ;; Vector register file base in linear memory (default 64KB)
-  ;; We model v0..v31 each as 16 bytes (v128) for SIMD path
+  ;; We model v0..v31 each as 256 bytes (VLEN=2048 bits)
   (global $vreg_base (mut i32) (i32.const 65536))
 
   ;; Helper: Sign extend 32-bit to 64-bit

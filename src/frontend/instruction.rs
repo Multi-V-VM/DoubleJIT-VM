@@ -302,10 +302,10 @@ pub enum RVV {
     // Vector configuration instructions
     VSETIVLI(Rd, Imm32<19, 0>),      // vsetvli with immediate
     VSETVLI(Rd, Rs1, Imm32<30, 20>), // vsetvli
-    VSETVL(Rd, Rs1, Rs2),             // vsetvl
+    VSETVL(Rd, Rs1, Rs2),            // vsetvl
 
     // Vector load/store unit-stride
-    VLM_V(Rd, Rs1),                   // unit-stride mask load
+    VLM_V(Rd, Rs1), // unit-stride mask load
     VLE8_V(Rd, Rs1, VM),
     VLE16_V(Rd, Rs1, VM),
     VLE32_V(Rd, Rs1, VM),
@@ -315,7 +315,7 @@ pub enum RVV {
     VLE512_V(Rd, Rs1, VM),
     VLE1024_V(Rd, Rs1, VM),
 
-    VSM_V(Rs3, Rs1),                  // unit-stride mask store
+    VSM_V(Rs3, Rs1), // unit-stride mask store
     VSE8_V(Rs3, Rs1, VM),
     VSE16_V(Rs3, Rs1, VM),
     VSE32_V(Rs3, Rs1, VM),
@@ -1854,6 +1854,173 @@ macro_rules! rvv {
     ($ident1:ident,$ident2:ident) => { Instr::RV32(RV32Instr::$ident1($ident1::$ident2)) };
     ($ident1:ident,$ident2:ident, $($t:expr),*) => { Instr::RV32(RV32Instr::$ident1($ident1::$ident2($( $t, )*))) };
 }
+
+fn x_reg(n: u32) -> Reg {
+    Reg::X(Xx::new(n))
+}
+
+fn v_reg(n: u32) -> Reg {
+    Reg::V(Xx::new(n))
+}
+
+fn rv64v(instr: RVV) -> Instr {
+    Instr::RV64(RV64Instr::RV64V(instr))
+}
+
+fn parse_vector_unit_load(bit: u32) -> Option<Instr> {
+    let nf = slice(bit, 29, 3, 0);
+    let mew = slice(bit, 28, 1, 0);
+    let mop = slice(bit, 26, 2, 0);
+    let lumop = rs2(bit);
+    if nf != 0 || mew != 0 || mop != 0 || lumop != 0 {
+        return None;
+    }
+
+    let vd = Rd(v_reg(rd(bit)));
+    let base = Rs1(x_reg(rs1(bit)));
+    let mask = VM(vm(bit));
+    match funct3(bit) {
+        0b000 => Some(rv64v(RVV::VLE8_V(vd, base, mask))),
+        0b101 => Some(rv64v(RVV::VLE16_V(vd, base, mask))),
+        0b110 => Some(rv64v(RVV::VLE32_V(vd, base, mask))),
+        0b111 => Some(rv64v(RVV::VLE64_V(vd, base, mask))),
+        _ => None,
+    }
+}
+
+fn parse_vector_unit_store(bit: u32) -> Option<Instr> {
+    let nf = slice(bit, 29, 3, 0);
+    let mew = slice(bit, 28, 1, 0);
+    let mop = slice(bit, 26, 2, 0);
+    let sumop = rs2(bit);
+    if nf != 0 || mew != 0 || mop != 0 || sumop != 0 {
+        return None;
+    }
+
+    let vs3 = Rs3(v_reg(rd(bit)));
+    let base = Rs1(x_reg(rs1(bit)));
+    let mask = VM(vm(bit));
+    match funct3(bit) {
+        0b000 => Some(rv64v(RVV::VSE8_V(vs3, base, mask))),
+        0b101 => Some(rv64v(RVV::VSE16_V(vs3, base, mask))),
+        0b110 => Some(rv64v(RVV::VSE32_V(vs3, base, mask))),
+        0b111 => Some(rv64v(RVV::VSE64_V(vs3, base, mask))),
+        _ => None,
+    }
+}
+
+fn vector_vi_imm(bit: u32) -> Imm32<19, 15> {
+    Imm32::<19, 15>::from(slice_back(bit, 15, 5, 15))
+}
+
+fn parse_vector_config(bit: u32) -> Option<Instr> {
+    if funct6(bit) == 0b100000 {
+        return Some(rv64v(RVV::VSETVL(
+            Rd(x_reg(rd(bit))),
+            Rs1(x_reg(rs1(bit))),
+            Rs2(x_reg(rs2(bit))),
+        )));
+    }
+
+    if slice(bit, 30, 2, 0) == 0b11 {
+        return Some(rv64v(RVV::VSETIVLI(
+            Rd(x_reg(rd(bit))),
+            Imm32::<19, 0>::from(slice(bit, 15, 5, 0) | slice(bit, 20, 10, 5)),
+        )));
+    }
+
+    if slice(bit, 31, 1, 0) == 0 {
+        return Some(rv64v(RVV::VSETVLI(
+            Rd(x_reg(rd(bit))),
+            Rs1(x_reg(rs1(bit))),
+            Imm32::<30, 20>::from(slice(bit, 20, 11, 20)),
+        )));
+    }
+
+    None
+}
+
+fn parse_vector_opcode(bit: u32) -> Option<Instr> {
+    let vd = Rd(v_reg(rd(bit)));
+    let mask = VM(vm(bit));
+    let lhs_v = Rs1(v_reg(rs2(bit)));
+    let rhs_v = Rs2(v_reg(rs1(bit)));
+    let rhs_x = Rs2(x_reg(rs1(bit)));
+    let src_v = Rs1(v_reg(rs1(bit)));
+    let src_x = Rs1(x_reg(rs1(bit)));
+
+    match funct3(bit) {
+        0b111 => parse_vector_config(bit),
+        0b000 => match (funct6(bit), vm(bit), rs2(bit)) {
+            (0b000000, _, _) => Some(rv64v(RVV::VADD_VV(vd, lhs_v, rhs_v, mask))),
+            (0b000010, _, _) => Some(rv64v(RVV::VSUB_VV(vd, lhs_v, rhs_v, mask))),
+            (0b001001, _, _) => Some(rv64v(RVV::VAND_VV(vd, lhs_v, rhs_v, mask))),
+            (0b001010, _, _) => Some(rv64v(RVV::VOR_VV(vd, lhs_v, rhs_v, mask))),
+            (0b001011, _, _) => Some(rv64v(RVV::VXOR_VV(vd, lhs_v, rhs_v, mask))),
+            (0b010111, true, 0) => Some(rv64v(RVV::VMV_V_V(vd, src_v))),
+            _ => None,
+        },
+        0b010 => match (funct6(bit), vm(bit), rs1(bit)) {
+            (0b100101, _, _) => Some(rv64v(RVV::VMUL_VV(vd, lhs_v, rhs_v, mask))),
+            (0b010000, true, 0) => Some(rv64v(RVV::VMV_X_S(
+                Rd(x_reg(rd(bit))),
+                Rs2(v_reg(rs2(bit))),
+            ))),
+            _ => None,
+        },
+        0b011 => match (funct6(bit), vm(bit), rs2(bit)) {
+            (0b000000, _, _) => Some(rv64v(RVV::VADD_VI(
+                vd,
+                Rs2(v_reg(rs2(bit))),
+                vector_vi_imm(bit),
+                mask,
+            ))),
+            (0b000011, _, _) => Some(rv64v(RVV::VRSUB_VI(
+                vd,
+                Rs2(v_reg(rs2(bit))),
+                vector_vi_imm(bit),
+                mask,
+            ))),
+            (0b001001, _, _) => Some(rv64v(RVV::VAND_VI(
+                vd,
+                Rs2(v_reg(rs2(bit))),
+                vector_vi_imm(bit),
+                mask,
+            ))),
+            (0b001010, _, _) => Some(rv64v(RVV::VOR_VI(
+                vd,
+                Rs2(v_reg(rs2(bit))),
+                vector_vi_imm(bit),
+                mask,
+            ))),
+            (0b001011, _, _) => Some(rv64v(RVV::VXOR_VI(
+                vd,
+                Rs2(v_reg(rs2(bit))),
+                vector_vi_imm(bit),
+                mask,
+            ))),
+            (0b010111, true, 0) => Some(rv64v(RVV::VMV_V_I(vd, vector_vi_imm(bit)))),
+            _ => None,
+        },
+        0b100 => match (funct6(bit), vm(bit), rs2(bit)) {
+            (0b000000, _, _) => Some(rv64v(RVV::VADD_VX(vd, lhs_v, rhs_x, mask))),
+            (0b000010, _, _) => Some(rv64v(RVV::VSUB_VX(vd, lhs_v, rhs_x, mask))),
+            (0b000011, _, _) => Some(rv64v(RVV::VRSUB_VX(vd, lhs_v, rhs_x, mask))),
+            (0b001001, _, _) => Some(rv64v(RVV::VAND_VX(vd, lhs_v, rhs_x, mask))),
+            (0b001010, _, _) => Some(rv64v(RVV::VOR_VX(vd, lhs_v, rhs_x, mask))),
+            (0b001011, _, _) => Some(rv64v(RVV::VXOR_VX(vd, lhs_v, rhs_x, mask))),
+            (0b010111, true, 0) => Some(rv64v(RVV::VMV_V_X(vd, src_x))),
+            _ => None,
+        },
+        0b110 => match (funct6(bit), vm(bit), rs2(bit)) {
+            (0b100101, _, _) => Some(rv64v(RVV::VMUL_VX(vd, lhs_v, rhs_x, mask))),
+            (0b010000, true, 0) => Some(rv64v(RVV::VMV_S_X(vd, src_x))),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 impl Instruction {
     pub fn parse(bit: &[u8]) -> Instruction {
         if let Some(instr) = try_from_compressed(bit) {
@@ -1887,6 +2054,7 @@ impl Instruction {
                         _ => None,
                     }
                 }
+                0b0000111 => parse_vector_unit_load(bit_u32),
                 0b0010011 => {
                     let funct3_val = funct3(bit_u32);
 
@@ -1972,6 +2140,7 @@ impl Instruction {
                     0b011 => Some(s!(rv64, RV64I, SD, bit_u32, gp)),
                     _ => None,
                 },
+                0b0100111 => parse_vector_unit_store(bit_u32),
                 0b0110011 => {
                     let inst = match (funct3(bit_u32), funct7(bit_u32)) {
                         (0b000, 0b0000000) => Some(r!(rv32, RV32I, ADD, bit_u32, gp)),
@@ -2332,32 +2501,7 @@ impl Instruction {
                     0b01 => Some(r4!(rv32_no_e, RV32D, FNMSUB_D, bit_u32, fp)),
                     _ => None,
                 },
-                0b1010111 => match funct3(bit_u32) {
-                    0b111 => {
-                        // Vector configuration instructions (VSETVLI, VSETIVLI, VSETVL)
-                        match bit_u32 {
-                            // VSETVLI: vd, rs1, vtypei[30:20]
-                            x if x & 0b10000000000000000111000001111111 == 0b00000000000000000111000001010111 => Some(Instr::RV64(RV64Instr::RV64V(RVV::VSETVLI(
-                                Rd(Reg::V(Xx::new(rd(bit_u32)))),
-                                Rs1(Reg::X(Xx::new(rs1(bit_u32)))),
-                                Imm32::<30, 20>::from(utils::x(bit_u32, 20, 11, 0)),
-                            )))),
-                            // VSETIVLI: vd, uimm, vtypei[29:20]
-                            x if x & 0b11000000000000000111000001111111 == 0b11000000000000000111000001010111 => Some(Instr::RV64(RV64Instr::RV64V(RVV::VSETIVLI(
-                                Rd(Reg::V(Xx::new(rd(bit_u32)))),
-                                Imm32::<19, 0>::from(utils::x(bit_u32, 15, 5, 0) | (utils::x(bit_u32, 20, 10, 5))),
-                            )))),
-                            // VSETVL: vd, rs1, rs2
-                            x if x & 0b11111110000000000111000001111111 == 0b10000000000000000111000001010111 => Some(Instr::RV64(RV64Instr::RV64V(RVV::VSETVL(
-                                Rd(Reg::V(Xx::new(rd(bit_u32)))),
-                                Rs1(Reg::X(Xx::new(rs1(bit_u32)))),
-                                Rs2(Reg::X(Xx::new(rs2(bit_u32)))),
-                            )))),
-                            _ => None,
-                        }
-                    }
-                    _ => None,
-                },
+                0b1010111 => parse_vector_opcode(bit_u32),
                 _ => None,
             }
             .unwrap_or_else(|| {
@@ -2559,15 +2703,89 @@ mod tests {
     }
     #[test]
     fn test_rvv() {
-        let instr_asm: u32 = 0b10010000000000000000001110011;
+        let instr_asm: u32 = 0x0d0170d7; // vsetvli x1, x2, e32, m1, ta, ma
         let instr = Instruction::parse(&instr_asm.to_le_bytes());
         dbg!(instr.clone());
-        // assert_eq!(
-        //     instr.instr,
-        //     Instr::RV64(RV64Instr::RV64V(RV64V::(
-        //         Rs1(Reg::X(Xx::new(0))),
-        //         Rs2(Reg::X(Xx::new(0)))
-        //     )))
-        // );
+        assert_eq!(
+            instr.instr,
+            Instr::RV64(RV64Instr::RV64V(RVV::VSETVLI(
+                Rd(Reg::X(Xx::new(1))),
+                Rs1(Reg::X(Xx::new(2))),
+                Imm32::<30, 20>::from(0x0d0 << 20),
+            )))
+        );
+    }
+
+    fn encode_v_op(funct6: u32, funct3: u32, vd: u32, vs2: u32, rs1_or_imm: u32) -> u32 {
+        (funct6 << 26)
+            | (1 << 25)
+            | (vs2 << 20)
+            | (rs1_or_imm << 15)
+            | (funct3 << 12)
+            | (vd << 7)
+            | 0b1010111
+    }
+
+    fn encode_v_mem(opcode: u32, width: u32, reg: u32, rs1: u32) -> u32 {
+        (1 << 25) | (rs1 << 15) | (width << 12) | (reg << 7) | opcode
+    }
+
+    #[test]
+    fn test_rvv_unit_stride_load_store() {
+        let load = Instruction::parse(&encode_v_mem(0b0000111, 0b110, 1, 2).to_le_bytes());
+        assert_eq!(
+            load.instr,
+            Instr::RV64(RV64Instr::RV64V(RVV::VLE32_V(
+                Rd(Reg::V(Xx::new(1))),
+                Rs1(Reg::X(Xx::new(2))),
+                VM(true)
+            )))
+        );
+
+        let store = Instruction::parse(&encode_v_mem(0b0100111, 0b110, 3, 4).to_le_bytes());
+        assert_eq!(
+            store.instr,
+            Instr::RV64(RV64Instr::RV64V(RVV::VSE32_V(
+                Rs3(Reg::V(Xx::new(3))),
+                Rs1(Reg::X(Xx::new(4))),
+                VM(true)
+            )))
+        );
+    }
+
+    #[test]
+    fn test_rvv_integer_op_decode_uses_assembly_operand_order() {
+        let vsub = Instruction::parse(&encode_v_op(0b000010, 0b000, 1, 2, 3).to_le_bytes());
+        assert_eq!(
+            vsub.instr,
+            Instr::RV64(RV64Instr::RV64V(RVV::VSUB_VV(
+                Rd(Reg::V(Xx::new(1))),
+                Rs1(Reg::V(Xx::new(2))),
+                Rs2(Reg::V(Xx::new(3))),
+                VM(true)
+            )))
+        );
+
+        let vadd_vx = Instruction::parse(&encode_v_op(0b000000, 0b100, 1, 2, 3).to_le_bytes());
+        assert_eq!(
+            vadd_vx.instr,
+            Instr::RV64(RV64Instr::RV64V(RVV::VADD_VX(
+                Rd(Reg::V(Xx::new(1))),
+                Rs1(Reg::V(Xx::new(2))),
+                Rs2(Reg::X(Xx::new(3))),
+                VM(true)
+            )))
+        );
+
+        let vadd_vi = Instruction::parse(&encode_v_op(0b000000, 0b011, 1, 2, 7).to_le_bytes());
+        assert_eq!(
+            vadd_vi.instr,
+            Instr::RV64(RV64Instr::RV64V(RVV::VADD_VI(
+                Rd(Reg::V(Xx::new(1))),
+                Rs2(Reg::V(Xx::new(2))),
+                Imm32::<19, 15>::from(7 << 15),
+                VM(true)
+            )))
+        );
     }
 }

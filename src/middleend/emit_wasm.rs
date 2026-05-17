@@ -1,7 +1,46 @@
 use crate::frontend::instruction::{
-    Instruction, Instr, RV32Instr, RV64Instr, RV32I, RV64I, RV32M, RV64M, RVV, RVZcsr, Reg, Xx, Rd, Rs1, Rs2, Rs3, VM
+    Instr, Instruction, RV32Instr, RV64Instr, RVZcsr, Rd, Reg, Rs1, Rs2, Rs3, RV32I, RV32M, RV64I,
+    RV64M, RVV, VM,
 };
 use std::fmt::Write as FmtWrite;
+
+const VECTOR_REGISTER_BYTES: i32 = 256;
+const VECTOR_I32_LANES: i64 = (VECTOR_REGISTER_BYTES / 4) as i64;
+
+fn load_op(elem_bytes: i32) -> &'static str {
+    match elem_bytes {
+        1 => "i32.load8_u",
+        2 => "i32.load16_u",
+        4 => "i32.load",
+        8 => "i64.load",
+        _ => unreachable!("unsupported RVV element width"),
+    }
+}
+
+fn store_op(elem_bytes: i32) -> &'static str {
+    match elem_bytes {
+        1 => "i32.store8",
+        2 => "i32.store16",
+        4 => "i32.store",
+        8 => "i64.store",
+        _ => unreachable!("unsupported RVV element width"),
+    }
+}
+
+fn vtype_vlmax(vtype: u32) -> i64 {
+    let sew_bits = 8_i64 << ((vtype >> 3) & 0x7);
+    let (lmul_num, lmul_den) = match vtype & 0x7 {
+        0b000 => (1_i64, 1_i64),
+        0b001 => (2, 1),
+        0b010 => (4, 1),
+        0b011 => (8, 1),
+        0b111 => (1, 2),
+        0b110 => (1, 4),
+        0b101 => (1, 8),
+        _ => return 0,
+    };
+    ((i64::from(VECTOR_REGISTER_BYTES) * 8) * lmul_num / sew_bits / lmul_den).max(0)
+}
 
 /// WasmEmitter translates RISC-V instructions to WebAssembly Text (WAT) format
 pub struct WasmEmitter {
@@ -38,7 +77,7 @@ impl WasmEmitter {
         writeln!(
             &mut self.wat_code,
             // Predeclare locals used by vector/SIMD emission and dispatch
-            "  (func ${} (export \"{}\") (local $tmp_addr i32) (local $tmp_v1 v128) (local $tmp_v2 v128) (local $tmp_v v128) (local $bucket i32)",
+            "  (func ${} (export \"{}\") (local $tmp_addr i32) (local $tmp_v1 v128) (local $tmp_v2 v128) (local $tmp_v v128) (local $bucket i32) (local $i i32) (local $vl_i32 i32) (local $tmp_i64 i64)",
             name, name
         )
         .unwrap();
@@ -54,7 +93,11 @@ impl WasmEmitter {
         writeln!(&mut self.wat_code, "      ;; Check if program should exit").unwrap();
         writeln!(&mut self.wat_code, "      global.get $exit_flag").unwrap();
         writeln!(&mut self.wat_code, "      if").unwrap();
-        writeln!(&mut self.wat_code, "        return  ;; Exit function if exit_flag is set").unwrap();
+        writeln!(
+            &mut self.wat_code,
+            "        return  ;; Exit function if exit_flag is set"
+        )
+        .unwrap();
         writeln!(&mut self.wat_code, "      end").unwrap();
 
         // If PC becomes 0 unexpectedly, re-seed from $entry_pc (provided by embedding runtime)
@@ -67,7 +110,11 @@ impl WasmEmitter {
         writeln!(&mut self.wat_code, "      end").unwrap();
 
         // Compute dispatch bucket: bucket = ((pc >> 2) & 255)
-        writeln!(&mut self.wat_code, "      ;; Compute dispatch bucket from PC").unwrap();
+        writeln!(
+            &mut self.wat_code,
+            "      ;; Compute dispatch bucket from PC"
+        )
+        .unwrap();
         writeln!(&mut self.wat_code, "      global.get $pc").unwrap();
         writeln!(&mut self.wat_code, "      i64.const 2").unwrap();
         writeln!(&mut self.wat_code, "      i64.shr_u").unwrap();
@@ -101,7 +148,11 @@ impl WasmEmitter {
         }
 
         // Loop back
-        writeln!(&mut self.wat_code, "      ;; Loop back to check exit flag and execute next instruction").unwrap();
+        writeln!(
+            &mut self.wat_code,
+            "      ;; Loop back to check exit flag and execute next instruction"
+        )
+        .unwrap();
         writeln!(&mut self.wat_code, "      br $interpreter_loop").unwrap();
         writeln!(&mut self.wat_code, "    )").unwrap(); // Close loop
     }
@@ -122,6 +173,14 @@ impl WasmEmitter {
         let label = format!("label_{}", self.label_counter);
         self.label_counter += 1;
         label
+    }
+
+    /// Emit one RVV instruction into the current function body.
+    ///
+    /// This is used by custom benchmarks and other straight-line codegen paths
+    /// that need the RVV backend without the interpreter-style PC dispatch.
+    pub fn emit_rvv_instruction(&mut self, instr: &RVV) -> Result<(), String> {
+        self.emit_rvv(instr)
     }
 
     /// Emit a single RISC-V instruction as WAT
@@ -166,7 +225,12 @@ impl WasmEmitter {
                 RV32Instr::RVV(rvv) => self.emit_rvv(&rvv)?,
                 RV32Instr::RVZcsr(z) => self.emit_zicsr(&z)?,
                 _ => {
-                    writeln!(&mut self.wat_code, "          ;; TODO: RV32 instruction {:?}", rv32instr).unwrap();
+                    writeln!(
+                        &mut self.wat_code,
+                        "          ;; TODO: RV32 instruction {:?}",
+                        rv32instr
+                    )
+                    .unwrap();
                 }
             },
             Instr::RV64(rv64instr) => match rv64instr {
@@ -175,14 +239,24 @@ impl WasmEmitter {
                 RV64Instr::RV64V(rvv) => self.emit_rvv(&rvv)?,
                 RV64Instr::RVZcsr(z) => self.emit_zicsr(&z)?,
                 _ => {
-                    writeln!(&mut self.wat_code, "          ;; TODO: RV64 instruction {:?}", rv64instr).unwrap();
+                    writeln!(
+                        &mut self.wat_code,
+                        "          ;; TODO: RV64 instruction {:?}",
+                        rv64instr
+                    )
+                    .unwrap();
                 }
             },
             Instr::NOP => {
                 writeln!(&mut self.wat_code, "          ;; NOP").unwrap();
             }
             _ => {
-                writeln!(&mut self.wat_code, "          ;; TODO: instruction {:?}", instr).unwrap();
+                writeln!(
+                    &mut self.wat_code,
+                    "          ;; TODO: instruction {:?}",
+                    instr
+                )
+                .unwrap();
             }
         }
 
@@ -1130,142 +1204,106 @@ impl WasmEmitter {
         use crate::frontend::instruction::RVV::*;
 
         match instr {
-            VSETVLI(Rd(rd), Rs1(rs1), _) => {
+            VSETVLI(Rd(rd), Rs1(rs1), vtypei) => {
                 let rd_num = self.reg_num(rd)?;
                 let rs1_num = self.reg_num(rs1)?;
-                writeln!(
-                    &mut self.wat_code,
-                    "        ;; VSETVLI - configure vector length\n        global.get $x{}\n        global.set $vl\n        global.get $vl\n        global.set $x{}",
-                    rs1_num, rd_num
-                )
-                .unwrap();
+                self.emit_vsetvl_from_reg("VSETVLI", rd_num, rs1_num, vtypei.decode() as i64)?;
             }
 
-            VSETIVLI(Rd(rd), _) => {
+            VSETIVLI(Rd(rd), encoded) => {
                 let rd_num = self.reg_num(rd)?;
-                writeln!(
-                    &mut self.wat_code,
-                    "        ;; VSETIVLI - configure vector length (immediate)\n        ;; TODO: parse immediate\n        i64.const 0\n        global.set $x{}",
-                    rd_num
-                )
-                .unwrap();
+                let encoded = encoded.decode();
+                let avl = i64::from(encoded & 0x1f);
+                let vtype = i64::from(encoded >> 5);
+                self.emit_vsetvl_from_imm("VSETIVLI", rd_num, avl, vtype)?;
             }
 
             VSETVL(Rd(rd), Rs1(rs1), Rs2(rs2)) => {
                 let rd_num = self.reg_num(rd)?;
                 let rs1_num = self.reg_num(rs1)?;
                 let rs2_num = self.reg_num(rs2)?;
-                writeln!(
-                    &mut self.wat_code,
-                    "        ;; VSETVL - configure vector length\n        global.get $x{}\n        global.set $vl\n        global.get $x{}\n        global.set $vtype\n        global.get $vl\n        global.set $x{}",
-                    rs1_num, rs2_num, rd_num
-                )
-                .unwrap();
+                self.emit_vsetvl_dynamic(rd_num, rs1_num, rs2_num)?;
             }
 
-            // Unit-stride vector loads (SIMD path for 32-bit elements)
-            VLE32_V(Rd(vd), Rs1(rs1), VM(true)) => {
-                let vd_num = self.reg_num(vd)? as i32;
-                let rs1_num = self.reg_num(rs1)?;
-                let vd_off = vd_num * 16; // v128 per vreg
-                writeln!(
-                    &mut self.wat_code,
-                    "        ;; VLE32.V v{}, (x{}) -> vreg[v{}]\n        ;; dest addr = vreg_base + v*16\n        global.get $vreg_base\n        i32.const {}\n        i32.add\n        ;; value = *mem[x_rs1] as v128\n        global.get $x{}\n        call $vaddr_to_offset\n        v128.load\n        v128.store",
-                    vd_num, rs1_num, vd_num, vd_off, rs1_num
-                )
-                .unwrap();
+            VLE8_V(Rd(vd), Rs1(rs1), VM(true)) => self.emit_vector_load("VLE8.V", vd, rs1, 1)?,
+            VLE16_V(Rd(vd), Rs1(rs1), VM(true)) => self.emit_vector_load("VLE16.V", vd, rs1, 2)?,
+            VLE32_V(Rd(vd), Rs1(rs1), VM(true)) => self.emit_vector_load("VLE32.V", vd, rs1, 4)?,
+            VLE64_V(Rd(vd), Rs1(rs1), VM(true)) => self.emit_vector_load("VLE64.V", vd, rs1, 8)?,
+            VSE8_V(Rs3(vs3), Rs1(rs1), VM(true)) => {
+                self.emit_vector_store("VSE8.V", vs3, rs1, 1)?
             }
-
-            // Unit-stride vector stores (SIMD path for 32-bit elements)
+            VSE16_V(Rs3(vs3), Rs1(rs1), VM(true)) => {
+                self.emit_vector_store("VSE16.V", vs3, rs1, 2)?
+            }
             VSE32_V(Rs3(vs3), Rs1(rs1), VM(true)) => {
-                let vs3_num = self.reg_num(vs3)? as i32;
-                let rs1_num = self.reg_num(rs1)?;
-                let vs3_off = vs3_num * 16; // v128 per vreg
-                writeln!(
-                    &mut self.wat_code,
-                    "        ;; VSE32.V v{}, (x{})\n        ;; mem addr = x_rs1\n        global.get $x{}\n        call $vaddr_to_offset\n        ;; value = vreg[v{}]\n        global.get $vreg_base\n        i32.const {}\n        i32.add\n        v128.load\n        v128.store",
-                    vs3_num, rs1_num, rs1_num, vs3_num, vs3_off
-                )
-                .unwrap();
+                self.emit_vector_store("VSE32.V", vs3, rs1, 4)?
+            }
+            VSE64_V(Rs3(vs3), Rs1(rs1), VM(true)) => {
+                self.emit_vector_store("VSE64.V", vs3, rs1, 8)?
             }
 
-            // Vector integer adds: VADD.VV (unmasked) using i32x4 lanes
-            VADD_VV(Rd(vd), Rs1(vs1), Rs2(vs2), VM(true)) => {
-                let vd_num = self.reg_num(vd)? as i32;
-                let vs1_num = self.reg_num(vs1)? as i32;
-                let vs2_num = self.reg_num(vs2)? as i32;
-                let vd_off = vd_num * 16;
-                let vs1_off = vs1_num * 16;
-                let vs2_off = vs2_num * 16;
-                writeln!(
-                    &mut self.wat_code,
-                    "        ;; VADD.VV v{}, v{}, v{} (i32x4)\n        ;; tmp_addr = vreg_base + vd*16\n        global.get $vreg_base\n        i32.const {}\n        i32.add\n        local.set $tmp_addr\n        ;; tmp_v1 = vreg[vs1]\n        global.get $vreg_base\n        i32.const {}\n        i32.add\n        v128.load\n        local.set $tmp_v1\n        ;; tmp_v2 = vreg[vs2]\n        global.get $vreg_base\n        i32.const {}\n        i32.add\n        v128.load\n        local.set $tmp_v2\n        ;; store tmp_v1 + tmp_v2 into vreg[vd]\n        local.get $tmp_addr\n        local.get $tmp_v1\n        local.get $tmp_v2\n        i32x4.add\n        v128.store",
-                    vd_num, vs1_num, vs2_num, vd_off, vs1_off, vs2_off
-                )
-                .unwrap();
+            VADD_VV(Rd(vd), Rs1(lhs), Rs2(rhs), VM(true)) => {
+                self.emit_vector_binary_vv("VADD.VV", vd, lhs, rhs, "i32.add")?
+            }
+            VSUB_VV(Rd(vd), Rs1(lhs), Rs2(rhs), VM(true)) => {
+                self.emit_vector_binary_vv("VSUB.VV", vd, lhs, rhs, "i32.sub")?
+            }
+            VAND_VV(Rd(vd), Rs1(lhs), Rs2(rhs), VM(true)) => {
+                self.emit_vector_binary_vv("VAND.VV", vd, lhs, rhs, "i32.and")?
+            }
+            VOR_VV(Rd(vd), Rs1(lhs), Rs2(rhs), VM(true)) => {
+                self.emit_vector_binary_vv("VOR.VV", vd, lhs, rhs, "i32.or")?
+            }
+            VXOR_VV(Rd(vd), Rs1(lhs), Rs2(rhs), VM(true)) => {
+                self.emit_vector_binary_vv("VXOR.VV", vd, lhs, rhs, "i32.xor")?
+            }
+            VMUL_VV(Rd(vd), Rs1(lhs), Rs2(rhs), VM(true)) => {
+                self.emit_vector_binary_vv("VMUL.VV", vd, lhs, rhs, "i32.mul")?
             }
 
-            // VSUB.VV (i32x4 lanes)
-            VSUB_VV(Rd(vd), Rs1(vs1), Rs2(vs2), VM(true)) => {
-                let vd_num = self.reg_num(vd)? as i32;
-                let vs1_num = self.reg_num(vs1)? as i32;
-                let vs2_num = self.reg_num(vs2)? as i32;
-                let vd_off = vd_num * 16;
-                let vs1_off = vs1_num * 16;
-                let vs2_off = vs2_num * 16;
-                writeln!(
-                    &mut self.wat_code,
-                    "        ;; VSUB.VV v{}, v{}, v{} (i32x4)\n        global.get $vreg_base\n        i32.const {}\n        i32.add\n        local.set $tmp_addr\n        global.get $vreg_base\n        i32.const {}\n        i32.add\n        v128.load\n        local.set $tmp_v1\n        global.get $vreg_base\n        i32.const {}\n        i32.add\n        v128.load\n        local.set $tmp_v2\n        local.get $tmp_addr\n        local.get $tmp_v1\n        local.get $tmp_v2\n        i32x4.sub\n        v128.store",
-                    vd_num, vs1_num, vs2_num, vd_off, vs1_off, vs2_off
-                )
-                .unwrap();
+            VADD_VX(Rd(vd), Rs1(lhs), Rs2(rhs), VM(true)) => {
+                self.emit_vector_binary_vx("VADD.VX", vd, lhs, rhs, "i32.add", false)?
+            }
+            VSUB_VX(Rd(vd), Rs1(lhs), Rs2(rhs), VM(true)) => {
+                self.emit_vector_binary_vx("VSUB.VX", vd, lhs, rhs, "i32.sub", false)?
+            }
+            VRSUB_VX(Rd(vd), Rs1(lhs), Rs2(rhs), VM(true)) => {
+                self.emit_vector_binary_vx("VRSUB.VX", vd, lhs, rhs, "i32.sub", true)?
+            }
+            VAND_VX(Rd(vd), Rs1(lhs), Rs2(rhs), VM(true)) => {
+                self.emit_vector_binary_vx("VAND.VX", vd, lhs, rhs, "i32.and", false)?
+            }
+            VOR_VX(Rd(vd), Rs1(lhs), Rs2(rhs), VM(true)) => {
+                self.emit_vector_binary_vx("VOR.VX", vd, lhs, rhs, "i32.or", false)?
+            }
+            VXOR_VX(Rd(vd), Rs1(lhs), Rs2(rhs), VM(true)) => {
+                self.emit_vector_binary_vx("VXOR.VX", vd, lhs, rhs, "i32.xor", false)?
+            }
+            VMUL_VX(Rd(vd), Rs1(lhs), Rs2(rhs), VM(true)) => {
+                self.emit_vector_binary_vx("VMUL.VX", vd, lhs, rhs, "i32.mul", false)?
             }
 
-            // Bitwise ops (i32x4 lanes)
-            VAND_VV(Rd(vd), Rs1(vs1), Rs2(vs2), VM(true)) => {
-                let vd_num = self.reg_num(vd)? as i32;
-                let vs1_num = self.reg_num(vs1)? as i32;
-                let vs2_num = self.reg_num(vs2)? as i32;
-                let vd_off = vd_num * 16;
-                let vs1_off = vs1_num * 16;
-                let vs2_off = vs2_num * 16;
-                writeln!(
-                    &mut self.wat_code,
-                    "        ;; VAND.VV v{}, v{}, v{} (i32x4)\n        global.get $vreg_base\n        i32.const {}\n        i32.add\n        local.set $tmp_addr\n        global.get $vreg_base\n        i32.const {}\n        i32.add\n        v128.load\n        local.set $tmp_v1\n        global.get $vreg_base\n        i32.const {}\n        i32.add\n        v128.load\n        local.set $tmp_v2\n        local.get $tmp_addr\n        local.get $tmp_v1\n        local.get $tmp_v2\n        v128.and\n        v128.store",
-                    vd_num, vs1_num, vs2_num, vd_off, vs1_off, vs2_off
-                )
-                .unwrap();
+            VADD_VI(Rd(vd), Rs2(lhs), imm, VM(true)) => {
+                self.emit_vector_binary_vi("VADD.VI", vd, lhs, imm.decode_sext(), "i32.add", false)?
+            }
+            VRSUB_VI(Rd(vd), Rs2(lhs), imm, VM(true)) => {
+                self.emit_vector_binary_vi("VRSUB.VI", vd, lhs, imm.decode_sext(), "i32.sub", true)?
+            }
+            VAND_VI(Rd(vd), Rs2(lhs), imm, VM(true)) => {
+                self.emit_vector_binary_vi("VAND.VI", vd, lhs, imm.decode_sext(), "i32.and", false)?
+            }
+            VOR_VI(Rd(vd), Rs2(lhs), imm, VM(true)) => {
+                self.emit_vector_binary_vi("VOR.VI", vd, lhs, imm.decode_sext(), "i32.or", false)?
+            }
+            VXOR_VI(Rd(vd), Rs2(lhs), imm, VM(true)) => {
+                self.emit_vector_binary_vi("VXOR.VI", vd, lhs, imm.decode_sext(), "i32.xor", false)?
             }
 
-            VOR_VV(Rd(vd), Rs1(vs1), Rs2(vs2), VM(true)) => {
-                let vd_num = self.reg_num(vd)? as i32;
-                let vs1_num = self.reg_num(vs1)? as i32;
-                let vs2_num = self.reg_num(vs2)? as i32;
-                let vd_off = vd_num * 16;
-                let vs1_off = vs1_num * 16;
-                let vs2_off = vs2_num * 16;
-                writeln!(
-                    &mut self.wat_code,
-                    "        ;; VOR.VV v{}, v{}, v{} (i32x4)\n        global.get $vreg_base\n        i32.const {}\n        i32.add\n        local.set $tmp_addr\n        global.get $vreg_base\n        i32.const {}\n        i32.add\n        v128.load\n        local.set $tmp_v1\n        global.get $vreg_base\n        i32.const {}\n        i32.add\n        v128.load\n        local.set $tmp_v2\n        local.get $tmp_addr\n        local.get $tmp_v1\n        local.get $tmp_v2\n        v128.or\n        v128.store",
-                    vd_num, vs1_num, vs2_num, vd_off, vs1_off, vs2_off
-                )
-                .unwrap();
-            }
-
-            VXOR_VV(Rd(vd), Rs1(vs1), Rs2(vs2), VM(true)) => {
-                let vd_num = self.reg_num(vd)? as i32;
-                let vs1_num = self.reg_num(vs1)? as i32;
-                let vs2_num = self.reg_num(vs2)? as i32;
-                let vd_off = vd_num * 16;
-                let vs1_off = vs1_num * 16;
-                let vs2_off = vs2_num * 16;
-                writeln!(
-                    &mut self.wat_code,
-                    "        ;; VXOR.VV v{}, v{}, v{} (i32x4)\n        global.get $vreg_base\n        i32.const {}\n        i32.add\n        local.set $tmp_addr\n        global.get $vreg_base\n        i32.const {}\n        i32.add\n        v128.load\n        local.set $tmp_v1\n        global.get $vreg_base\n        i32.const {}\n        i32.add\n        v128.load\n        local.set $tmp_v2\n        local.get $tmp_addr\n        local.get $tmp_v1\n        local.get $tmp_v2\n        v128.xor\n        v128.store",
-                    vd_num, vs1_num, vs2_num, vd_off, vs1_off, vs2_off
-                )
-                .unwrap();
-            }
+            VMV_V_V(Rd(vd), Rs1(src)) => self.emit_vector_move_vv(vd, src)?,
+            VMV_V_X(Rd(vd), Rs1(src)) => self.emit_vector_splat_x(vd, src)?,
+            VMV_V_I(Rd(vd), imm) => self.emit_vector_splat_i(vd, imm.decode_sext())?,
+            VMV_X_S(Rd(rd), Rs2(src)) => self.emit_vector_move_x_s(rd, src)?,
+            VMV_S_X(Rd(vd), Rs1(src)) => self.emit_vector_move_s_x(vd, src)?,
 
             // Vector arithmetic - all other vector instructions are stubs for now
             _ => {
@@ -1279,6 +1317,344 @@ impl WasmEmitter {
         }
 
         Ok(())
+    }
+
+    fn emit_vector_loop_header(&mut self, comment: &str) -> usize {
+        let label_id = self.label_counter;
+        self.label_counter += 1;
+        writeln!(
+            &mut self.wat_code,
+            "        ;; {}\n        i32.const 0\n        local.set $i\n        global.get $vl\n        i32.wrap_i64\n        local.set $vl_i32\n        block $vector_done_{}\n          loop $vector_loop_{}\n            local.get $i\n            local.get $vl_i32\n            i32.ge_u\n            br_if $vector_done_{}",
+            comment, label_id, label_id, label_id
+        )
+        .unwrap();
+        label_id
+    }
+
+    fn emit_vector_loop_footer(&mut self, label_id: usize) {
+        writeln!(
+            &mut self.wat_code,
+            "            local.get $i\n            i32.const 1\n            i32.add\n            local.set $i\n            br $vector_loop_{}\n          end\n        end",
+            label_id
+        )
+        .unwrap();
+    }
+
+    fn emit_vreg_addr(&mut self, reg_num: i32, elem_bytes: i32) {
+        writeln!(
+            &mut self.wat_code,
+            "            global.get $vreg_base\n            i32.const {}\n            i32.add\n            local.get $i\n            i32.const {}\n            i32.mul\n            i32.add",
+            reg_num * VECTOR_REGISTER_BYTES,
+            elem_bytes
+        )
+        .unwrap();
+    }
+
+    fn emit_memory_addr(&mut self, base_reg: usize, elem_bytes: i32) {
+        writeln!(
+            &mut self.wat_code,
+            "            global.get $x{}\n            local.get $i\n            i64.extend_i32_u\n            i64.const {}\n            i64.mul\n            i64.add\n            call $vaddr_to_offset",
+            base_reg, elem_bytes
+        )
+        .unwrap();
+    }
+
+    fn emit_vector_load(
+        &mut self,
+        name: &str,
+        vd: &Reg,
+        rs1: &Reg,
+        elem_bytes: i32,
+    ) -> Result<(), String> {
+        let vd_num = self.reg_num(vd)? as i32;
+        let rs1_num = self.reg_num(rs1)?;
+        let label = self.emit_vector_loop_header(&format!("{} v{}, (x{})", name, vd_num, rs1_num));
+        self.emit_vreg_addr(vd_num, elem_bytes);
+        self.emit_memory_addr(rs1_num, elem_bytes);
+        writeln!(
+            &mut self.wat_code,
+            "            {}\n            {}",
+            load_op(elem_bytes),
+            store_op(elem_bytes)
+        )
+        .unwrap();
+        self.emit_vector_loop_footer(label);
+        Ok(())
+    }
+
+    fn emit_vector_store(
+        &mut self,
+        name: &str,
+        vs3: &Reg,
+        rs1: &Reg,
+        elem_bytes: i32,
+    ) -> Result<(), String> {
+        let vs3_num = self.reg_num(vs3)? as i32;
+        let rs1_num = self.reg_num(rs1)?;
+        let label = self.emit_vector_loop_header(&format!("{} v{}, (x{})", name, vs3_num, rs1_num));
+        self.emit_memory_addr(rs1_num, elem_bytes);
+        self.emit_vreg_addr(vs3_num, elem_bytes);
+        writeln!(
+            &mut self.wat_code,
+            "            {}\n            {}",
+            load_op(elem_bytes),
+            store_op(elem_bytes)
+        )
+        .unwrap();
+        self.emit_vector_loop_footer(label);
+        Ok(())
+    }
+
+    fn emit_vector_binary_vv(
+        &mut self,
+        name: &str,
+        vd: &Reg,
+        lhs: &Reg,
+        rhs: &Reg,
+        op: &str,
+    ) -> Result<(), String> {
+        let vd_num = self.reg_num(vd)? as i32;
+        let lhs_num = self.reg_num(lhs)? as i32;
+        let rhs_num = self.reg_num(rhs)? as i32;
+        let label = self
+            .emit_vector_loop_header(&format!("{} v{}, v{}, v{}", name, vd_num, lhs_num, rhs_num));
+        self.emit_vreg_addr(vd_num, 4);
+        self.emit_vreg_addr(lhs_num, 4);
+        writeln!(&mut self.wat_code, "            i32.load").unwrap();
+        self.emit_vreg_addr(rhs_num, 4);
+        writeln!(
+            &mut self.wat_code,
+            "            i32.load\n            {}\n            i32.store",
+            op
+        )
+        .unwrap();
+        self.emit_vector_loop_footer(label);
+        Ok(())
+    }
+
+    fn emit_vector_binary_vx(
+        &mut self,
+        name: &str,
+        vd: &Reg,
+        lhs: &Reg,
+        rhs: &Reg,
+        op: &str,
+        reverse: bool,
+    ) -> Result<(), String> {
+        let vd_num = self.reg_num(vd)? as i32;
+        let lhs_num = self.reg_num(lhs)? as i32;
+        let rhs_num = self.reg_num(rhs)?;
+        let label = self
+            .emit_vector_loop_header(&format!("{} v{}, v{}, x{}", name, vd_num, lhs_num, rhs_num));
+        self.emit_vreg_addr(vd_num, 4);
+        if reverse {
+            writeln!(
+                &mut self.wat_code,
+                "            global.get $x{}\n            i32.wrap_i64",
+                rhs_num
+            )
+            .unwrap();
+            self.emit_vreg_addr(lhs_num, 4);
+            writeln!(&mut self.wat_code, "            i32.load").unwrap();
+        } else {
+            self.emit_vreg_addr(lhs_num, 4);
+            writeln!(
+                &mut self.wat_code,
+                "            i32.load\n            global.get $x{}\n            i32.wrap_i64",
+                rhs_num
+            )
+            .unwrap();
+        }
+        writeln!(
+            &mut self.wat_code,
+            "            {}\n            i32.store",
+            op
+        )
+        .unwrap();
+        self.emit_vector_loop_footer(label);
+        Ok(())
+    }
+
+    fn emit_vector_binary_vi(
+        &mut self,
+        name: &str,
+        vd: &Reg,
+        lhs: &Reg,
+        imm: i32,
+        op: &str,
+        reverse: bool,
+    ) -> Result<(), String> {
+        let vd_num = self.reg_num(vd)? as i32;
+        let lhs_num = self.reg_num(lhs)? as i32;
+        let label =
+            self.emit_vector_loop_header(&format!("{} v{}, v{}, {}", name, vd_num, lhs_num, imm));
+        self.emit_vreg_addr(vd_num, 4);
+        if reverse {
+            writeln!(&mut self.wat_code, "            i32.const {}", imm).unwrap();
+            self.emit_vreg_addr(lhs_num, 4);
+            writeln!(&mut self.wat_code, "            i32.load").unwrap();
+        } else {
+            self.emit_vreg_addr(lhs_num, 4);
+            writeln!(
+                &mut self.wat_code,
+                "            i32.load\n            i32.const {}",
+                imm
+            )
+            .unwrap();
+        }
+        writeln!(
+            &mut self.wat_code,
+            "            {}\n            i32.store",
+            op
+        )
+        .unwrap();
+        self.emit_vector_loop_footer(label);
+        Ok(())
+    }
+
+    fn emit_vector_move_vv(&mut self, vd: &Reg, src: &Reg) -> Result<(), String> {
+        self.emit_vector_binary_vi("VMV.V.V", vd, src, 0, "i32.add", false)
+    }
+
+    fn emit_vector_splat_x(&mut self, vd: &Reg, src: &Reg) -> Result<(), String> {
+        let vd_num = self.reg_num(vd)? as i32;
+        let src_num = self.reg_num(src)?;
+        let label = self.emit_vector_loop_header(&format!("VMV.V.X v{}, x{}", vd_num, src_num));
+        self.emit_vreg_addr(vd_num, 4);
+        writeln!(
+            &mut self.wat_code,
+            "            global.get $x{}\n            i32.wrap_i64\n            i32.store",
+            src_num
+        )
+        .unwrap();
+        self.emit_vector_loop_footer(label);
+        Ok(())
+    }
+
+    fn emit_vector_splat_i(&mut self, vd: &Reg, imm: i32) -> Result<(), String> {
+        let vd_num = self.reg_num(vd)? as i32;
+        let label = self.emit_vector_loop_header(&format!("VMV.V.I v{}, {}", vd_num, imm));
+        self.emit_vreg_addr(vd_num, 4);
+        writeln!(
+            &mut self.wat_code,
+            "            i32.const {}\n            i32.store",
+            imm
+        )
+        .unwrap();
+        self.emit_vector_loop_footer(label);
+        Ok(())
+    }
+
+    fn emit_vector_move_x_s(&mut self, rd: &Reg, src: &Reg) -> Result<(), String> {
+        let rd_num = self.reg_num(rd)?;
+        let src_num = self.reg_num(src)? as i32;
+        writeln!(
+            &mut self.wat_code,
+            "        ;; VMV.X.S x{}, v{}\n        global.get $vreg_base\n        i32.const {}\n        i32.add\n        i32.load\n        i64.extend_i32_s",
+            rd_num,
+            src_num,
+            src_num * VECTOR_REGISTER_BYTES
+        )
+        .unwrap();
+        if rd_num != 0 {
+            writeln!(&mut self.wat_code, "        global.set $x{}", rd_num).unwrap();
+        } else {
+            writeln!(&mut self.wat_code, "        drop").unwrap();
+        }
+        Ok(())
+    }
+
+    fn emit_vector_move_s_x(&mut self, vd: &Reg, src: &Reg) -> Result<(), String> {
+        let vd_num = self.reg_num(vd)? as i32;
+        let src_num = self.reg_num(src)?;
+        writeln!(
+            &mut self.wat_code,
+            "        ;; VMV.S.X v{}, x{}\n        global.get $vreg_base\n        i32.const {}\n        i32.add\n        global.get $x{}\n        i32.wrap_i64\n        i32.store",
+            vd_num,
+            src_num,
+            vd_num * VECTOR_REGISTER_BYTES,
+            src_num
+        )
+        .unwrap();
+        Ok(())
+    }
+
+    fn emit_vsetvl_from_reg(
+        &mut self,
+        name: &str,
+        rd_num: usize,
+        rs1_num: usize,
+        vtype: i64,
+    ) -> Result<(), String> {
+        let vlmax = vtype_vlmax(vtype as u32);
+        writeln!(&mut self.wat_code, "        ;; {} - configure vector length\n        i64.const {}\n        global.set $vtype", name, vtype).unwrap();
+        if rs1_num == 0 && rd_num == 0 {
+            writeln!(&mut self.wat_code, "        global.get $vl").unwrap();
+            self.emit_i64_min_const(vlmax);
+        } else if rs1_num == 0 {
+            writeln!(&mut self.wat_code, "        i64.const {}", vlmax).unwrap();
+        } else {
+            writeln!(&mut self.wat_code, "        global.get $x{}", rs1_num).unwrap();
+            self.emit_i64_min_const(vlmax);
+        }
+        writeln!(&mut self.wat_code, "        global.set $vl").unwrap();
+        self.emit_write_vl_to_rd(rd_num);
+        Ok(())
+    }
+
+    fn emit_vsetvl_from_imm(
+        &mut self,
+        name: &str,
+        rd_num: usize,
+        avl: i64,
+        vtype: i64,
+    ) -> Result<(), String> {
+        let vlmax = vtype_vlmax(vtype as u32);
+        writeln!(&mut self.wat_code, "        ;; {} - configure vector length\n        i64.const {}\n        global.set $vtype\n        i64.const {}", name, vtype, avl).unwrap();
+        self.emit_i64_min_const(vlmax);
+        writeln!(&mut self.wat_code, "        global.set $vl").unwrap();
+        self.emit_write_vl_to_rd(rd_num);
+        Ok(())
+    }
+
+    fn emit_vsetvl_dynamic(
+        &mut self,
+        rd_num: usize,
+        rs1_num: usize,
+        rs2_num: usize,
+    ) -> Result<(), String> {
+        writeln!(&mut self.wat_code, "        ;; VSETVL - configure vector length\n        global.get $x{}\n        global.set $vtype", rs2_num).unwrap();
+        if rs1_num == 0 && rd_num == 0 {
+            writeln!(&mut self.wat_code, "        global.get $vl").unwrap();
+        } else if rs1_num == 0 {
+            writeln!(&mut self.wat_code, "        i64.const {}", VECTOR_I32_LANES).unwrap();
+        } else {
+            writeln!(&mut self.wat_code, "        global.get $x{}", rs1_num).unwrap();
+        }
+        self.emit_i64_min_const(VECTOR_I32_LANES);
+        writeln!(&mut self.wat_code, "        global.set $vl").unwrap();
+        self.emit_write_vl_to_rd(rd_num);
+        Ok(())
+    }
+
+    fn emit_i64_min_const(&mut self, upper: i64) {
+        writeln!(
+            &mut self.wat_code,
+            "        local.set $tmp_i64\n        local.get $tmp_i64\n        i64.const {}\n        i64.gt_u\n        if (result i64)\n          i64.const {}\n        else\n          local.get $tmp_i64\n        end",
+            upper, upper
+        )
+        .unwrap();
+    }
+
+    fn emit_write_vl_to_rd(&mut self, rd_num: usize) {
+        if rd_num != 0 {
+            writeln!(
+                &mut self.wat_code,
+                "        global.get $vl\n        global.set $x{}",
+                rd_num
+            )
+            .unwrap();
+        }
     }
 
     /// Emit Zicsr CSR operations via runtime helpers
@@ -1411,6 +1787,23 @@ impl Default for WasmEmitter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::frontend::instruction::{Imm32, Xx, RVV};
+
+    fn x(n: u32) -> Reg {
+        Reg::X(Xx::new(n))
+    }
+
+    fn v(n: u32) -> Reg {
+        Reg::V(Xx::new(n))
+    }
+
+    fn emit_rvv_wat(instr: RVV) -> String {
+        let mut emitter = WasmEmitter::new();
+        emitter.start_function("test");
+        emitter.emit_rvv(&instr).unwrap();
+        emitter.end_function();
+        emitter.finalize()
+    }
 
     #[test]
     fn test_emitter_creation() {
@@ -1425,5 +1818,60 @@ mod tests {
         emitter.end_function();
         let wat = emitter.finalize();
         assert!(wat.contains("(func $test"));
+    }
+
+    #[test]
+    fn test_rvv_vsetvli_emits_vl_clamp() {
+        let wat = emit_rvv_wat(RVV::VSETVLI(
+            Rd(x(1)),
+            Rs1(x(2)),
+            Imm32::<30, 20>::from(0x0d0 << 20),
+        ));
+        assert!(wat.contains("global.set $vtype"));
+        assert!(wat.contains("i64.const 208"));
+        assert!(wat.contains("i64.const 64"));
+        assert!(wat.contains("global.set $x1"));
+    }
+
+    #[test]
+    fn test_rvv_unit_stride_load_emits_vl_loop() {
+        let wat = emit_rvv_wat(RVV::VLE32_V(Rd(v(1)), Rs1(x(2)), VM(true)));
+        assert!(wat.contains("VLE32.V v1, (x2)"));
+        assert!(wat.contains("loop $vector_loop_"));
+        assert!(wat.contains("global.get $vl"));
+        assert!(wat.contains("i32.load"));
+        assert!(wat.contains("i32.store"));
+        assert!(wat.contains("i32.const 256"));
+    }
+
+    #[test]
+    fn test_rvv_integer_vx_emits_scalar_operand() {
+        let wat = emit_rvv_wat(RVV::VRSUB_VX(Rd(v(1)), Rs1(v(2)), Rs2(x(3)), VM(true)));
+        assert!(wat.contains("VRSUB.VX v1, v2, x3"));
+        assert!(wat.contains("global.get $x3"));
+        assert!(wat.contains("i32.sub"));
+        assert!(wat.contains("i32.store"));
+    }
+
+    #[test]
+    fn test_rvv_generated_wat_is_valid() {
+        let function = emit_rvv_wat(RVV::VLE32_V(Rd(v(1)), Rs1(x(2)), VM(true)));
+        let module = format!(
+            r#"(module
+  (memory 1)
+  (global $vreg_base (mut i32) (i32.const 0))
+  (global $vl (mut i64) (i64.const 4))
+  (global $vtype (mut i64) (i64.const 0))
+  (global $x1 (mut i64) (i64.const 0))
+  (global $x2 (mut i64) (i64.const 0))
+  (func $vaddr_to_offset (param $vaddr i64) (result i32)
+    local.get $vaddr
+    i32.wrap_i64)
+{}
+)"#,
+            function
+        );
+        let wasm = wasmer::wat2wasm(module.as_bytes()).unwrap();
+        assert!(!wasm.is_empty());
     }
 }
