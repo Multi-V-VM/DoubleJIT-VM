@@ -234,8 +234,14 @@ mod tests {
         cache.rejit_block(&[(0x1000, addi())]).unwrap();
         let previous = cache.get(0x1000).unwrap().program.to_bytes();
 
-        let unsupported = Instr::RV32(RV32Instr::RV32I(RV32I::ADD(Rd(x(3)), Rs1(x(1)), Rs2(x(2)))));
-        let err = cache.rejit_block(&[(0x1000, unsupported)]).unwrap_err();
+        let missing_pointer_proof = Instr::RV32(RV32Instr::RV32I(RV32I::LBU(
+            Rd(x(1)),
+            Rs1(x(2)),
+            Imm32::<11, 0>::from(0),
+        )));
+        let err = cache
+            .rejit_block(&[(0x1000, missing_pointer_proof)])
+            .unwrap_err();
         assert!(matches!(err, EbpfRejitError::Compile(_)));
         assert_eq!(cache.get(0x1000).unwrap().program.to_bytes(), previous);
     }

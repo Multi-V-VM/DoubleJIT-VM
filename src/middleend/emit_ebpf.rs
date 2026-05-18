@@ -46,6 +46,7 @@ const BPF_CALL: u32 = 0x80;
 const BPF_EXIT: u32 = 0x90;
 
 const DEFAULT_KERNEL_MAX_INSNS: usize = 1_000_000;
+const SCALAR_HELPER_BASE: u32 = 0x2000_0000;
 const RVV_HELPER_BASE: u32 = 0x4000_0000;
 
 /// A fully verified eBPF program backed by Aya's `bpf_insn` bindings.
@@ -398,11 +399,21 @@ fn lower_instr(
 ) -> Result<Lowered, EbpfCompileError> {
     match instr {
         Instr::NOP => Ok(noop("nop")),
-        Instr::RV32(RV32Instr::RV32I(inst)) => lower_rv32i(pc, index, instr, inst, pc_to_index),
-        Instr::RV32(RV32Instr::RV32M(inst)) => lower_rv32m(pc, instr, inst),
+        Instr::RV32(RV32Instr::RV32I(inst)) => lower_scalar_or_helper(
+            index,
+            instr,
+            lower_rv32i(pc, index, instr, inst, pc_to_index),
+        ),
+        Instr::RV32(RV32Instr::RV32M(inst)) => {
+            lower_scalar_or_helper(index, instr, lower_rv32m(pc, instr, inst))
+        }
         Instr::RV32(RV32Instr::RVV(inst)) => lower_rvv(pc, instr, inst),
-        Instr::RV64(RV64Instr::RV64I(inst)) => lower_rv64i(pc, instr, inst),
-        Instr::RV64(RV64Instr::RV64M(inst)) => lower_rv64m(pc, instr, inst),
+        Instr::RV64(RV64Instr::RV64I(inst)) => {
+            lower_scalar_or_helper(index, instr, lower_rv64i(pc, instr, inst))
+        }
+        Instr::RV64(RV64Instr::RV64M(inst)) => {
+            lower_scalar_or_helper(index, instr, lower_rv64m(pc, instr, inst))
+        }
         Instr::RV64(RV64Instr::RV64V(inst)) => lower_rvv(pc, instr, inst),
         _ => unsupported(
             pc,
@@ -410,6 +421,63 @@ fn lower_instr(
             "only RV32I/RV32M/RV64I/RV64M scalar subset and RVV helper-call subset are supported",
         ),
     }
+}
+
+fn lower_scalar_or_helper(
+    source_index: usize,
+    source: Instr,
+    direct: Result<Lowered, EbpfCompileError>,
+) -> Result<Lowered, EbpfCompileError> {
+    match direct {
+        Ok(lowered) if needs_scalar_helper_for_kernel_preflight(source, &lowered) => {
+            Ok(scalar_helper_lowered(
+                source_index,
+                "scalar.backward_control_flow.helper_call",
+                "helper executes decoded RISC-V scalar control-flow semantics",
+            ))
+        }
+        Ok(lowered) => Ok(lowered),
+        Err(EbpfCompileError::Unsupported { .. })
+        | Err(EbpfCompileError::MissingBranchTarget { .. })
+        | Err(EbpfCompileError::BranchOffsetOutOfRange { .. }) => Ok(scalar_helper_lowered(
+            source_index,
+            "scalar.helper_call",
+            "helper executes decoded RISC-V scalar instruction semantics",
+        )),
+        Err(err) => Err(err),
+    }
+}
+
+fn needs_scalar_helper_for_kernel_preflight(source: Instr, lowered: &Lowered) -> bool {
+    let code = u32::from(lowered.insn.code);
+    let is_backward_jump = (code & 0x07) == BPF_JMP
+        && (code & 0xf0) != BPF_CALL
+        && (code & 0xf0) != BPF_EXIT
+        && lowered.insn.off < 0;
+
+    is_backward_jump
+        && matches!(
+            source,
+            Instr::RV32(RV32Instr::RV32I(RV32I::JAL(Rd(Reg::X(rd)), _))) if rd.value() == 0
+        )
+}
+
+fn scalar_helper_lowered(source_index: usize, rule: &'static str, effect: &'static str) -> Lowered {
+    lowered(
+        helper_call(scalar_helper_slot(source_index)),
+        rule,
+        vec![
+            "eBPF helper-call descriptor names the scalar source-instruction proof slot",
+            "scalar helper ABI is available to the eBPF runtime",
+            "helper implementation is obligated to match the decoded RISC-V scalar instruction semantics",
+        ],
+        effect,
+    )
+}
+
+fn scalar_helper_slot(source_index: usize) -> i32 {
+    let slot = (source_index as u32) & 0x0fff_ffff;
+    (SCALAR_HELPER_BASE | slot) as i32
 }
 
 fn lower_rvv(pc: u64, source: Instr, instr: RVV) -> Result<Lowered, EbpfCompileError> {
@@ -1684,13 +1752,23 @@ mod tests {
     }
 
     #[test]
-    fn add_requires_two_address_form() {
+    fn add_outside_two_address_form_uses_scalar_helper() {
         let instr = Instr::RV32(RV32Instr::RV32I(RV32I::ADD(Rd(x(3)), Rs1(x(1)), Rs2(x(2)))));
-        let err = EbpfCompiler::new()
-            .with_exit_trailer(false)
-            .compile_entries(&[(0x1000, instr)])
-            .unwrap_err();
-        assert!(matches!(err, EbpfCompileError::Unsupported { .. }));
+        let program = compile_one(instr);
+        let report = program.verify().unwrap();
+        assert!(report.one_to_one);
+        assert_eq!(program.instructions().len(), 1);
+
+        let ins = program.instructions()[0];
+        assert_eq!(u32::from(ins.code), BPF_JMP | BPF_CALL);
+        assert!(ins.imm > 0);
+
+        let proof = &program.proof_obligations()[0];
+        assert_eq!(proof.source, instr);
+        assert_eq!(proof.rule, "scalar.helper_call");
+        assert!(proof.preconditions.contains(
+            &"eBPF helper-call descriptor names the scalar source-instruction proof slot"
+        ));
     }
 
     #[test]
@@ -1776,6 +1854,50 @@ mod tests {
         assert_eq!(report.kernel.exit_instructions, 1);
         assert_eq!(report.kernel.memory_instructions, 0);
         assert_eq!(report.kernel.backward_jumps, 0);
+    }
+
+    #[test]
+    fn scalar_helper_call_passes_rejit_compile_time_preflight() {
+        let instr = Instr::RV32(RV32Instr::RV32I(RV32I::ADDI(
+            Rd(x(28)),
+            Rs1(x(0)),
+            Imm32::<11, 0>::from(1),
+        )));
+        let program = EbpfCompiler::new()
+            .with_exit_trailer(true)
+            .compile_entries(&[(0x1000, instr)])
+            .unwrap();
+
+        let report = program.verify_compile_time().unwrap();
+        assert!(report.compilation.one_to_one);
+        assert_eq!(report.compilation.source_instructions, 1);
+        assert_eq!(report.compilation.mapped_instructions, 1);
+        assert_eq!(report.compilation.trailer_instructions, 2);
+        assert_eq!(report.kernel.jump_instructions, 1);
+        assert_eq!(report.kernel.exit_instructions, 1);
+        assert_eq!(report.kernel.memory_instructions, 0);
+        assert_eq!(report.kernel.backward_jumps, 0);
+        assert_eq!(program.proof_obligations()[0].rule, "scalar.helper_call");
+    }
+
+    #[test]
+    fn backward_jal_x0_uses_scalar_helper_to_satisfy_kernel_preflight() {
+        let instr = Instr::RV32(RV32Instr::RV32I(RV32I::JAL(
+            Rd(x(0)),
+            Imm32::<20, 1>::from((-4i32) as u32),
+        )));
+        let program = EbpfCompiler::new()
+            .with_exit_trailer(true)
+            .compile_entries(&[(0x1000, Instr::NOP), (0x1004, instr)])
+            .unwrap();
+
+        let ins = program.instructions()[1];
+        assert_eq!(u32::from(ins.code), BPF_JMP | BPF_CALL);
+        assert_eq!(
+            program.proof_obligations()[1].rule,
+            "scalar.backward_control_flow.helper_call"
+        );
+        assert!(program.verify_compile_time().is_ok());
     }
 
     #[test]
