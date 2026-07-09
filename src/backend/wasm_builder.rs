@@ -141,6 +141,12 @@ impl WasmBuilder {
         &mut self.store
     }
 
+    /// Consume the builder and return its store for a long-lived module and
+    /// instance built with the same Wasmer engine.
+    pub fn into_store(self) -> Store {
+        self.store
+    }
+
     /// Get a reference to the engine
     pub fn engine(&self) -> &Engine {
         &self.engine
