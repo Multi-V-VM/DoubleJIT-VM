@@ -11,12 +11,15 @@ use core::fmt;
 use iced_x86::{Instruction, Mnemonic, OpKind, Register};
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
-use std::sync::Arc;
-use wasmer::{imports, Function, Instance, Module, Store, Value};
+use std::fs::{File, OpenOptions};
+use std::io::Write as IoWrite;
+use std::time::{SystemTime, UNIX_EPOCH};
+use wasmer::{imports, Function, FunctionEnv, FunctionEnvMut, Instance, Memory, Module, Store, Value};
 
-const STACK_TOP: u64 = 64 * 1024 * 1024;
+const STACK_TOP: u64 = 128 * 1024 * 1024;
 const STACK_SENTINEL: u64 = STACK_TOP - 8;
-const HEAP_BASE: u64 = 48 * 1024 * 1024;
+const HEAP_BASE: u64 = 8 * 1024 * 1024;
+const ARG_BASE: u64 = STACK_TOP - 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum X86ElfWasmError {
@@ -59,14 +62,481 @@ impl From<X86ElfError> for X86ElfWasmError {
 pub struct X86ElfWasmArtifact {
     wat: String,
     strings: BTreeMap<u64, String>,
+    symbols: BTreeMap<String, X86ElfWasmMemoryRegion>,
     instruction_count: usize,
+}
+
+/// A named, guest-addressable data region retained by the translated ELF.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct X86ElfWasmMemoryRegion {
+    pub address: u64,
+    pub size: u64,
 }
 
 pub struct X86ElfWasmRuntime {
     store: Store,
     _module: Module,
     _instance: Instance,
+    memory: Memory,
     run: Function,
+}
+
+struct HostHeap {
+    memory: Option<Memory>,
+    next: u64,
+    allocations: BTreeMap<u64, u64>,
+    free_blocks: Vec<(u64, u64)>,
+    strings: BTreeMap<u64, String>,
+    files: BTreeMap<i64, File>,
+    next_file: i64,
+    stdin: Vec<u8>,
+    stdin_offset: usize,
+    errno: i32,
+    errno_address: Option<u64>,
+}
+
+impl HostHeap {
+    fn new(strings: BTreeMap<u64, String>) -> Self {
+        Self {
+            memory: None,
+            next: HEAP_BASE,
+            allocations: BTreeMap::new(),
+            free_blocks: Vec::new(),
+            strings,
+            files: BTreeMap::new(),
+            next_file: 3,
+            stdin: std::env::var("DOUBLEJIT_STDIN")
+                .unwrap_or_default()
+                .into_bytes(),
+            stdin_offset: 0,
+            errno: 0,
+            errno_address: None,
+        }
+    }
+}
+
+fn allocation_size(request: i64) -> Option<u64> {
+    let request = u64::try_from(request).ok()?.max(1);
+    request.checked_add(15).map(|value| value & !15)
+}
+
+fn host_allocate(env: &mut FunctionEnvMut<HostHeap>, request: i64) -> i64 {
+    let Some(size) = allocation_size(request) else {
+        return -1;
+    };
+    let heap = env.data_mut();
+    if let Some(index) = heap
+        .free_blocks
+        .iter()
+        .position(|(_, available)| *available >= size)
+    {
+        let (pointer, available) = heap.free_blocks.swap_remove(index);
+        if available > size {
+            heap.free_blocks.push((pointer + size, available - size));
+        }
+        heap.allocations.insert(pointer, size);
+        return pointer as i64;
+    }
+
+    let Some(end) = heap.next.checked_add(size) else {
+        return -1;
+    };
+    if end >= STACK_SENTINEL {
+        return -1;
+    }
+    let pointer = heap.next;
+    heap.next = end;
+    heap.allocations.insert(pointer, size);
+    pointer as i64
+}
+
+fn host_malloc(mut env: FunctionEnvMut<HostHeap>, request: i64) -> i64 {
+    host_allocate(&mut env, request)
+}
+
+fn host_calloc(mut env: FunctionEnvMut<HostHeap>, count: i64, size: i64) -> i64 {
+    let Some(request) = count.checked_mul(size) else {
+        return -1;
+    };
+    let pointer = host_allocate(&mut env, request);
+    if pointer < 0 {
+        return pointer;
+    }
+    let Some(memory) = env.data().memory.clone() else {
+        return -1;
+    };
+    let Some(byte_count) = allocation_size(request) else {
+        return -1;
+    };
+    let bytes = vec![0; byte_count as usize];
+    if memory.view(&env).write(pointer as u64, &bytes).is_err() {
+        return -1;
+    }
+    pointer
+}
+
+fn host_free(mut env: FunctionEnvMut<HostHeap>, pointer: i64) {
+    if pointer <= 0 {
+        return;
+    }
+    let heap = env.data_mut();
+    if let Some(size) = heap.allocations.remove(&(pointer as u64)) {
+        heap.free_blocks.push((pointer as u64, size));
+    }
+}
+
+fn write_host_time(env: &FunctionEnvMut<HostHeap>, pointer: i64, seconds: i64, fraction: i64) -> bool {
+    let Some(memory) = env.data().memory.clone() else {
+        return false;
+    };
+    let Ok(pointer) = u64::try_from(pointer) else {
+        return false;
+    };
+    let mut bytes = [0_u8; 16];
+    bytes[..8].copy_from_slice(&seconds.to_le_bytes());
+    bytes[8..].copy_from_slice(&fraction.to_le_bytes());
+    memory.view(env).write(pointer, &bytes).is_ok()
+}
+
+fn host_gettimeofday(env: FunctionEnvMut<HostHeap>, timeval: i64, _timezone: i64) -> i64 {
+    let Ok(duration) = SystemTime::now().duration_since(UNIX_EPOCH) else {
+        return -1;
+    };
+    if write_host_time(
+        &env,
+        timeval,
+        duration.as_secs() as i64,
+        duration.subsec_micros() as i64,
+    ) {
+        0
+    } else {
+        -1
+    }
+}
+
+fn host_clock_gettime(env: FunctionEnvMut<HostHeap>, _clock: i64, timespec: i64) -> i64 {
+    let Ok(duration) = SystemTime::now().duration_since(UNIX_EPOCH) else {
+        return -1;
+    };
+    if write_host_time(
+        &env,
+        timespec,
+        duration.as_secs() as i64,
+        duration.subsec_nanos() as i64,
+    ) {
+        0
+    } else {
+        -1
+    }
+}
+
+fn guest_bytes(env: &FunctionEnvMut<HostHeap>, pointer: i64, length: usize) -> Option<Vec<u8>> {
+    let memory = env.data().memory.clone()?;
+    let pointer = u64::try_from(pointer).ok()?;
+    memory
+        .view(env)
+        .copy_range_to_vec(pointer..pointer.checked_add(length as u64)?)
+        .ok()
+}
+
+fn guest_string(env: &FunctionEnvMut<HostHeap>, pointer: i64) -> Option<String> {
+    if let Some(bytes) = guest_bytes(env, pointer, 4096) {
+        let end = bytes.iter().position(|byte| *byte == 0).unwrap_or(bytes.len());
+        return Some(String::from_utf8_lossy(&bytes[..end]).into_owned());
+    }
+    env.data().strings.get(&(pointer as u64)).cloned()
+}
+
+fn write_guest(env: &FunctionEnvMut<HostHeap>, pointer: i64, bytes: &[u8]) -> bool {
+    let Some(memory) = env.data().memory.clone() else {
+        return false;
+    };
+    let Ok(pointer) = u64::try_from(pointer) else {
+        return false;
+    };
+    memory.view(env).write(pointer, bytes).is_ok()
+}
+
+fn write_stdout(bytes: &[u8]) -> bool {
+    let mut stdout = std::io::stdout().lock();
+    stdout.write_all(bytes).and_then(|_| stdout.flush()).is_ok()
+}
+
+fn format_strings(env: &FunctionEnvMut<HostHeap>, args: &[i64]) -> BTreeMap<u64, String> {
+    let mut strings = env.data().strings.clone();
+    for argument in args {
+        if let Some(value) = guest_string(env, *argument) {
+            strings.insert(*argument as u64, value);
+        }
+    }
+    strings
+}
+
+fn host_printf(
+    env: FunctionEnvMut<HostHeap>,
+    format: i64,
+    arg1: i64,
+    arg2: i64,
+    arg3: i64,
+    arg4: i64,
+    arg5: i64,
+    float0: f64,
+    float1: f64,
+    float2: f64,
+    float3: f64,
+    float4: f64,
+    float5: f64,
+    float6: f64,
+    float7: f64,
+) -> i64 {
+    let Some(format) = guest_string(&env, format) else {
+        return -1;
+    };
+    let integers = [arg1, arg2, arg3, arg4, arg5];
+    let strings = format_strings(&env, &integers);
+    let output = render_printf(
+        &format,
+        &integers,
+        &[float0, float1, float2, float3, float4, float5, float6, float7],
+        &strings,
+    );
+    if write_stdout(output.as_bytes()) {
+        output.len() as i64
+    } else {
+        -1
+    }
+}
+
+fn host_puts(env: FunctionEnvMut<HostHeap>, value: i64) -> i64 {
+    let Some(value) = guest_string(&env, value) else {
+        return -1;
+    };
+    let mut output = value;
+    output.push('\n');
+    if write_stdout(output.as_bytes()) {
+        output.len() as i64
+    } else {
+        -1
+    }
+}
+
+fn write_stream(env: &mut FunctionEnvMut<HostHeap>, stream: i64, bytes: &[u8]) -> bool {
+    if stream <= 2 {
+        return write_stdout(bytes);
+    }
+    match env.data_mut().files.get_mut(&stream) {
+        Some(file) => file.write_all(bytes).is_ok(),
+        None => false,
+    }
+}
+
+fn host_fprintf(
+    mut env: FunctionEnvMut<HostHeap>,
+    stream: i64,
+    format: i64,
+    arg1: i64,
+    arg2: i64,
+    arg3: i64,
+    arg4: i64,
+    float0: f64,
+    float1: f64,
+    float2: f64,
+    float3: f64,
+    float4: f64,
+    float5: f64,
+    float6: f64,
+    float7: f64,
+) -> i64 {
+    let Some(format) = guest_string(&env, format) else {
+        return -1;
+    };
+    let integers = [arg1, arg2, arg3, arg4];
+    let strings = format_strings(&env, &integers);
+    let output = render_printf(
+        &format,
+        &integers,
+        &[float0, float1, float2, float3, float4, float5, float6, float7],
+        &strings,
+    );
+    if write_stream(&mut env, stream, output.as_bytes()) {
+        output.len() as i64
+    } else {
+        -1
+    }
+}
+
+fn host_fopen(mut env: FunctionEnvMut<HostHeap>, path: i64, mode: i64) -> i64 {
+    let Some(path) = guest_string(&env, path) else {
+        return 0;
+    };
+    let Some(mode) = guest_string(&env, mode) else {
+        return 0;
+    };
+    let mut options = OpenOptions::new();
+    let readable = mode.contains('r') || mode.contains('+');
+    let writable = mode.contains('w') || mode.contains('a') || mode.contains('+');
+    options.read(readable).write(writable);
+    if mode.contains('w') {
+        options.create(true).truncate(true);
+    }
+    if mode.contains('a') {
+        options.create(true).append(true);
+    }
+    match options.open(path) {
+        Ok(file) => {
+            let heap = env.data_mut();
+            let handle = heap.next_file;
+            heap.next_file += 1;
+            heap.files.insert(handle, file);
+            heap.errno = 0;
+            handle
+        }
+        Err(_) => {
+            env.data_mut().errno = 2;
+            0
+        }
+    }
+}
+
+fn host_fclose(mut env: FunctionEnvMut<HostHeap>, stream: i64) -> i64 {
+    match env.data_mut().files.remove(&stream) {
+        Some(mut file) => match file.flush() {
+            Ok(()) => 0,
+            Err(_) => -1,
+        },
+        None => -1,
+    }
+}
+
+fn host_fflush(mut env: FunctionEnvMut<HostHeap>, stream: i64) -> i64 {
+    if stream <= 2 {
+        return if std::io::stdout().flush().is_ok() { 0 } else { -1 };
+    }
+    match env.data_mut().files.get_mut(&stream) {
+        Some(file) => if file.flush().is_ok() { 0 } else { -1 },
+        None => -1,
+    }
+}
+
+fn host_fwrite(mut env: FunctionEnvMut<HostHeap>, pointer: i64, size: i64, count: i64, stream: i64) -> i64 {
+    let Some(total) = size.checked_mul(count).and_then(|value| usize::try_from(value).ok()) else {
+        return 0;
+    };
+    let Some(bytes) = guest_bytes(&env, pointer, total) else {
+        return 0;
+    };
+    if write_stream(&mut env, stream, &bytes) { count } else { 0 }
+}
+
+fn host_scanf(mut env: FunctionEnvMut<HostHeap>, format: i64, destination: i64) -> i64 {
+    let Some(format) = guest_string(&env, format) else {
+        return 0;
+    };
+    let (token, specifier) = {
+        let heap = env.data_mut();
+        let input = std::str::from_utf8(&heap.stdin[heap.stdin_offset..]).unwrap_or("");
+        let Some(token) = input.split_whitespace().next() else {
+            return 0;
+        };
+        heap.stdin_offset += input.find(token).unwrap_or_default() + token.len();
+        (token.to_string(), format.chars().last().unwrap_or_default())
+    };
+    match specifier {
+        'd' | 'i' => match token.parse::<i32>() {
+            Ok(value) if write_guest(&env, destination, &value.to_le_bytes()) => 1,
+            _ => 0,
+        },
+        'f' => match token.parse::<f64>() {
+            Ok(value) if format.contains("lf") && write_guest(&env, destination, &value.to_le_bytes()) => 1,
+            Ok(value) if write_guest(&env, destination, &(value as f32).to_le_bytes()) => 1,
+            _ => 0,
+        },
+        _ => 0,
+    }
+}
+
+fn host_atoi(env: FunctionEnvMut<HostHeap>, value: i64) -> i64 {
+    guest_string(&env, value)
+        .and_then(|value| value.trim().parse::<i64>().ok())
+        .unwrap_or_default()
+}
+
+fn host_putchar(_env: FunctionEnvMut<HostHeap>, value: i64) -> i64 {
+    if write_stdout(&[value as u8]) { value } else { -1 }
+}
+
+fn host_open(mut env: FunctionEnvMut<HostHeap>, path: i64, flags: i64, _mode: i64) -> i64 {
+    let Some(path) = guest_string(&env, path) else {
+        return -1;
+    };
+    let mut options = OpenOptions::new();
+    let write = flags & 3 != 0;
+    options.read(!write).write(write);
+    match options.open(path) {
+        Ok(file) => {
+            let heap = env.data_mut();
+            let handle = heap.next_file;
+            heap.next_file += 1;
+            heap.files.insert(handle, file);
+            heap.errno = 0;
+            handle
+        }
+        Err(_) => {
+            env.data_mut().errno = 2;
+            -1
+        }
+    }
+}
+
+fn host_fstat(env: FunctionEnvMut<HostHeap>, handle: i64, stat: i64) -> i64 {
+    let metadata = if handle <= 2 {
+        std::fs::metadata("/dev/stdout")
+    } else {
+        env.data()
+            .files
+            .get(&handle)
+            .and_then(|file| file.metadata().ok())
+            .ok_or_else(|| std::io::Error::from_raw_os_error(9))
+    };
+    let Ok(metadata) = metadata else {
+        return -1;
+    };
+    let mode = if metadata.is_dir() { 0o040755_u32 } else { 0o100644_u32 };
+    let mut bytes = [0_u8; 144];
+    bytes[8..16].copy_from_slice(&1_u64.to_le_bytes());
+    bytes[16..24].copy_from_slice(&1_u64.to_le_bytes());
+    bytes[24..28].copy_from_slice(&mode.to_le_bytes());
+    bytes[48..56].copy_from_slice(&(metadata.len() as i64).to_le_bytes());
+    if write_guest(&env, stat, &bytes) { 0 } else { -1 }
+}
+
+fn host_strerror(mut env: FunctionEnvMut<HostHeap>, errno: i64) -> i64 {
+    let message = match errno {
+        0 => "Success",
+        2 => "No such file or directory",
+        _ => "Unknown error",
+    };
+    let pointer = host_allocate(&mut env, message.len() as i64 + 1);
+    if pointer < 0 || !write_guest(&env, pointer, format!("{message}\0").as_bytes()) {
+        return 0;
+    }
+    pointer
+}
+
+fn host_errno_location(mut env: FunctionEnvMut<HostHeap>) -> i64 {
+    if let Some(pointer) = env.data().errno_address {
+        return pointer as i64;
+    }
+    let pointer = host_allocate(&mut env, 4);
+    if pointer < 0 || !write_guest(&env, pointer, &env.data().errno.to_le_bytes()) {
+        return 0;
+    }
+    env.data_mut().errno_address = Some(pointer as u64);
+    pointer
+}
+
+fn host_pow(_env: FunctionEnvMut<HostHeap>, base: f64, exponent: f64) -> f64 {
+    base.powf(exponent)
 }
 
 impl X86ElfWasmArtifact {
@@ -78,6 +548,11 @@ impl X86ElfWasmArtifact {
         self.instruction_count
     }
 
+    /// Return the address and ELF symbol size of a migratable data object.
+    pub fn symbol_region(&self, name: &str) -> Option<X86ElfWasmMemoryRegion> {
+        self.symbols.get(name).copied().filter(|region| region.size != 0)
+    }
+
     /// Compile and instantiate the translated ELF on the current Wasmer
     /// native backend. The returned instance is reusable for hot execution.
     pub fn prepare(&self) -> Result<X86ElfWasmRuntime, X86ElfWasmError> {
@@ -87,40 +562,61 @@ impl X86ElfWasmArtifact {
             .compile_wat(&self.wat)
             .map_err(|error| X86ElfWasmError::Runtime(error.to_string()))?;
         let mut store = builder.into_store();
-        let strings = Arc::new(self.strings.clone());
-        let printf_strings = Arc::clone(&strings);
-        let puts_strings = Arc::clone(&strings);
-        let printf = Function::new_typed(
-            &mut store,
-            move |format: i64, arg1: i64, arg2: i64, arg3: i64, arg4: i64, arg5: i64| -> i64 {
-                let args = [arg1, arg2, arg3, arg4, arg5];
-                match printf_strings.get(&(format as u64)) {
-                    Some(format) => {
-                        let output = render_printf(format, &args, &printf_strings);
-                        print!("{output}");
-                        output.len() as i64
-                    }
-                    None => -1,
-                }
-            },
-        );
-        let puts = Function::new_typed(&mut store, move |value: i64| -> i64 {
-            match puts_strings.get(&(value as u64)) {
-                Some(string) => {
-                    println!("{string}");
-                    string.len() as i64 + 1
-                }
-                None => -1,
-            }
-        });
+        let heap_env = FunctionEnv::new(&mut store, HostHeap::new(self.strings.clone()));
+        let printf = Function::new_typed_with_env(&mut store, &heap_env, host_printf);
+        let puts = Function::new_typed_with_env(&mut store, &heap_env, host_puts);
+        let malloc = Function::new_typed_with_env(&mut store, &heap_env, host_malloc);
+        let calloc = Function::new_typed_with_env(&mut store, &heap_env, host_calloc);
+        let free = Function::new_typed_with_env(&mut store, &heap_env, host_free);
+        let gettimeofday = Function::new_typed_with_env(&mut store, &heap_env, host_gettimeofday);
+        let clock_gettime = Function::new_typed_with_env(&mut store, &heap_env, host_clock_gettime);
+        let fprintf = Function::new_typed_with_env(&mut store, &heap_env, host_fprintf);
+        let fopen = Function::new_typed_with_env(&mut store, &heap_env, host_fopen);
+        let fclose = Function::new_typed_with_env(&mut store, &heap_env, host_fclose);
+        let fflush = Function::new_typed_with_env(&mut store, &heap_env, host_fflush);
+        let fwrite = Function::new_typed_with_env(&mut store, &heap_env, host_fwrite);
+        let scanf = Function::new_typed_with_env(&mut store, &heap_env, host_scanf);
+        let atoi = Function::new_typed_with_env(&mut store, &heap_env, host_atoi);
+        let putchar = Function::new_typed_with_env(&mut store, &heap_env, host_putchar);
+        let open = Function::new_typed_with_env(&mut store, &heap_env, host_open);
+        let fstat = Function::new_typed_with_env(&mut store, &heap_env, host_fstat);
+        let strerror = Function::new_typed_with_env(&mut store, &heap_env, host_strerror);
+        let errno_location = Function::new_typed_with_env(&mut store, &heap_env, host_errno_location);
+        let pow = Function::new_typed_with_env(&mut store, &heap_env, host_pow);
+        let no_op_int = Function::new_typed(&mut store, |_value: i64| -> i64 { 0 });
         let import_object = imports! {
             "env" => {
                 "doublejit_printf" => printf,
                 "doublejit_puts" => puts,
+                "doublejit_malloc" => malloc,
+                "doublejit_calloc" => calloc,
+                "doublejit_free" => free,
+                "doublejit_gettimeofday" => gettimeofday,
+                "doublejit_clock_gettime" => clock_gettime,
+                "doublejit_fprintf" => fprintf,
+                "doublejit_fopen" => fopen,
+                "doublejit_fclose" => fclose,
+                "doublejit_fflush" => fflush,
+                "doublejit_fwrite" => fwrite,
+                "doublejit_scanf" => scanf,
+                "doublejit_atoi" => atoi,
+                "doublejit_putchar" => putchar,
+                "doublejit_open" => open,
+                "doublejit_fstat" => fstat,
+                "doublejit_strerror" => strerror,
+                "doublejit_errno_location" => errno_location,
+                "doublejit_pow" => pow,
+                "doublejit_fenv_noop" => no_op_int,
             }
         };
         let instance = Instance::new(&mut store, &module, &import_object)
             .map_err(|error| X86ElfWasmError::Runtime(error.to_string()))?;
+        let memory = instance
+            .exports
+            .get_memory("memory")
+            .map_err(|error| X86ElfWasmError::Runtime(error.to_string()))?
+            .clone();
+        heap_env.as_mut(&mut store).memory = Some(memory.clone());
         let run = instance
             .exports
             .get_function("run")
@@ -130,6 +626,7 @@ impl X86ElfWasmArtifact {
             store,
             _module: module,
             _instance: instance,
+            memory,
             run,
         })
     }
@@ -143,9 +640,50 @@ impl X86ElfWasmArtifact {
 impl X86ElfWasmRuntime {
     /// Execute the already translated x86 ELF entry point.
     pub fn execute(&mut self) -> Result<i64, X86ElfWasmError> {
+        self.execute_with_args(&[])
+    }
+
+    /// Execute with a conventional guest `argc`/`argv` vector in WASM memory.
+    pub fn execute_with_args(&mut self, args: &[String]) -> Result<i64, X86ElfWasmError> {
+        let pointers_bytes = (args.len() + 1)
+            .checked_mul(8)
+            .ok_or_else(|| X86ElfWasmError::Runtime("guest argv is too large".to_string()))?;
+        let mut cursor = ARG_BASE + pointers_bytes as u64;
+        let mut pointers = Vec::with_capacity(args.len());
+        for arg in args {
+            let bytes = arg.as_bytes();
+            let end = cursor
+                .checked_add(bytes.len() as u64 + 1)
+                .ok_or_else(|| X86ElfWasmError::Runtime("guest argv is too large".to_string()))?;
+            if end >= STACK_SENTINEL {
+                return Err(X86ElfWasmError::Runtime(
+                    "guest argv overlaps the translated stack".to_string(),
+                ));
+            }
+            let mut terminated = bytes.to_vec();
+            terminated.push(0);
+            self.memory
+                .view(&self.store)
+                .write(cursor, &terminated)
+                .map_err(|error| X86ElfWasmError::Runtime(error.to_string()))?;
+            pointers.push(cursor);
+            cursor = end;
+        }
+        let mut raw_pointers = Vec::with_capacity(pointers_bytes);
+        for pointer in pointers {
+            raw_pointers.extend_from_slice(&pointer.to_le_bytes());
+        }
+        raw_pointers.extend_from_slice(&0_u64.to_le_bytes());
+        self.memory
+            .view(&self.store)
+            .write(ARG_BASE, &raw_pointers)
+            .map_err(|error| X86ElfWasmError::Runtime(error.to_string()))?;
         let result = self
             .run
-            .call(&mut self.store, &[])
+            .call(
+                &mut self.store,
+                &[Value::I64(args.len() as i64), Value::I64(ARG_BASE as i64)],
+            )
             .map_err(|error| X86ElfWasmError::Runtime(error.to_string()))?;
         match result.first() {
             Some(Value::I64(value)) => Ok(*value),
@@ -153,6 +691,40 @@ impl X86ElfWasmRuntime {
                 "translated main did not return an i64".to_string(),
             )),
         }
+    }
+
+    /// Copy an explicitly named guest region into a migration checkpoint.
+    pub fn snapshot_region(
+        &self,
+        region: X86ElfWasmMemoryRegion,
+    ) -> Result<Vec<u8>, X86ElfWasmError> {
+        let end = region
+            .address
+            .checked_add(region.size)
+            .ok_or_else(|| X86ElfWasmError::Runtime("migration region overflows guest memory".to_string()))?;
+        self.memory
+            .view(&self.store)
+            .copy_range_to_vec(region.address..end)
+            .map_err(|error| X86ElfWasmError::Runtime(error.to_string()))
+    }
+
+    /// Restore a checkpoint into the corresponding guest data region.
+    pub fn restore_region(
+        &mut self,
+        region: X86ElfWasmMemoryRegion,
+        checkpoint: &[u8],
+    ) -> Result<(), X86ElfWasmError> {
+        if checkpoint.len() as u64 != region.size {
+            return Err(X86ElfWasmError::Runtime(format!(
+                "checkpoint size {} does not match region size {}",
+                checkpoint.len(),
+                region.size
+            )));
+        }
+        self.memory
+            .view(&self.store)
+            .write(region.address, checkpoint)
+            .map_err(|error| X86ElfWasmError::Runtime(error.to_string()))
     }
 }
 
@@ -178,11 +750,45 @@ impl X86ElfWasmCompiler {
             .map(|(index, decoded)| (decoded.address, index))
             .collect::<BTreeMap<_, _>>();
         let strings = collect_strings(image);
+        let symbols = image
+            .symbol_addresses()
+            .iter()
+            .filter_map(|(name, address)| {
+                image.symbol_size(name).map(|size| {
+                    (
+                        name.clone(),
+                        X86ElfWasmMemoryRegion {
+                            address: *address,
+                            size,
+                        },
+                    )
+                })
+            })
+            .collect();
 
         let mut wat = String::new();
         wat.push_str("(module\n");
-        wat.push_str("  (import \"env\" \"doublejit_printf\" (func $doublejit_printf (param i64 i64 i64 i64 i64 i64) (result i64)))\n");
+        wat.push_str("  (import \"env\" \"doublejit_printf\" (func $doublejit_printf (param i64 i64 i64 i64 i64 i64 f64 f64 f64 f64 f64 f64 f64 f64) (result i64)))\n");
         wat.push_str("  (import \"env\" \"doublejit_puts\" (func $doublejit_puts (param i64) (result i64)))\n");
+        wat.push_str("  (import \"env\" \"doublejit_malloc\" (func $doublejit_malloc (param i64) (result i64)))\n");
+        wat.push_str("  (import \"env\" \"doublejit_calloc\" (func $doublejit_calloc (param i64 i64) (result i64)))\n");
+        wat.push_str("  (import \"env\" \"doublejit_free\" (func $doublejit_free (param i64)))\n");
+        wat.push_str("  (import \"env\" \"doublejit_gettimeofday\" (func $doublejit_gettimeofday (param i64 i64) (result i64)))\n");
+        wat.push_str("  (import \"env\" \"doublejit_clock_gettime\" (func $doublejit_clock_gettime (param i64 i64) (result i64)))\n");
+        wat.push_str("  (import \"env\" \"doublejit_fprintf\" (func $doublejit_fprintf (param i64 i64 i64 i64 i64 i64 f64 f64 f64 f64 f64 f64 f64 f64) (result i64)))\n");
+        wat.push_str("  (import \"env\" \"doublejit_fopen\" (func $doublejit_fopen (param i64 i64) (result i64)))\n");
+        wat.push_str("  (import \"env\" \"doublejit_fclose\" (func $doublejit_fclose (param i64) (result i64)))\n");
+        wat.push_str("  (import \"env\" \"doublejit_fflush\" (func $doublejit_fflush (param i64) (result i64)))\n");
+        wat.push_str("  (import \"env\" \"doublejit_fwrite\" (func $doublejit_fwrite (param i64 i64 i64 i64) (result i64)))\n");
+        wat.push_str("  (import \"env\" \"doublejit_scanf\" (func $doublejit_scanf (param i64 i64) (result i64)))\n");
+        wat.push_str("  (import \"env\" \"doublejit_atoi\" (func $doublejit_atoi (param i64) (result i64)))\n");
+        wat.push_str("  (import \"env\" \"doublejit_putchar\" (func $doublejit_putchar (param i64) (result i64)))\n");
+        wat.push_str("  (import \"env\" \"doublejit_open\" (func $doublejit_open (param i64 i64 i64) (result i64)))\n");
+        wat.push_str("  (import \"env\" \"doublejit_fstat\" (func $doublejit_fstat (param i64 i64) (result i64)))\n");
+        wat.push_str("  (import \"env\" \"doublejit_strerror\" (func $doublejit_strerror (param i64) (result i64)))\n");
+        wat.push_str("  (import \"env\" \"doublejit_errno_location\" (func $doublejit_errno_location (result i64)))\n");
+        wat.push_str("  (import \"env\" \"doublejit_pow\" (func $doublejit_pow (param f64 f64) (result f64)))\n");
+        wat.push_str("  (import \"env\" \"doublejit_fenv_noop\" (func $doublejit_fenv_noop (param i64) (result i64)))\n");
         writeln!(
             &mut wat,
             "  (memory (export \"memory\") {})",
@@ -191,11 +797,15 @@ impl X86ElfWasmCompiler {
         .unwrap();
         writeln!(&mut wat, "  (global $heap (mut i32) (i32.const {HEAP_BASE}))").unwrap();
         emit_data_segments(&mut wat, image);
-        wat.push_str("  (func $run (export \"run\") (result i64)\n");
+        wat.push_str("  (func $run (export \"run\") (param $guest_argc i64) (param $guest_argv i64) (result i64)\n");
         for register in X86Register::ALL {
             writeln!(&mut wat, "    (local ${} i64)", register.name()).unwrap();
         }
-        wat.push_str("    (local $pc i32)\n    (local $tmp i64)\n    (local $zf i32)\n    (local $sf i32)\n    (local $cf i32)\n");
+        for register in XmmRegister::ALL {
+            writeln!(&mut wat, "    (local ${} f64)", register.name()).unwrap();
+        }
+        wat.push_str("    (local $pc i32)\n    (local $tmp i64)\n    (local $zf i32)\n    (local $sf i32)\n    (local $cf i32)\n    (local $pf i32)\n");
+        wat.push_str("    (local.set $rdi (local.get $guest_argc))\n    (local.set $rsi (local.get $guest_argv))\n");
         writeln!(&mut wat, "    (local.set $rsp (i64.const {STACK_SENTINEL}))").unwrap();
         writeln!(&mut wat, "    (i64.store (i32.const {STACK_SENTINEL}) (i64.const -1))").unwrap();
         let entry_index = branch_index(entry, entry, &addresses)?;
@@ -212,6 +822,7 @@ impl X86ElfWasmCompiler {
         Ok(X86ElfWasmArtifact {
             wat,
             strings,
+            symbols,
             instruction_count: instructions.len(),
         })
     }
@@ -235,6 +846,43 @@ enum X86Register {
     R13,
     R14,
     R15,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum XmmRegister {
+    Xmm0,
+    Xmm1,
+    Xmm2,
+    Xmm3,
+    Xmm4,
+    Xmm5,
+    Xmm6,
+    Xmm7,
+    Xmm8,
+    Xmm9,
+    Xmm10,
+    Xmm11,
+    Xmm12,
+    Xmm13,
+    Xmm14,
+    Xmm15,
+}
+
+impl XmmRegister {
+    const ALL: [Self; 16] = [
+        Self::Xmm0, Self::Xmm1, Self::Xmm2, Self::Xmm3, Self::Xmm4, Self::Xmm5,
+        Self::Xmm6, Self::Xmm7, Self::Xmm8, Self::Xmm9, Self::Xmm10, Self::Xmm11,
+        Self::Xmm12, Self::Xmm13, Self::Xmm14, Self::Xmm15,
+    ];
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Xmm0 => "xmm0", Self::Xmm1 => "xmm1", Self::Xmm2 => "xmm2", Self::Xmm3 => "xmm3",
+            Self::Xmm4 => "xmm4", Self::Xmm5 => "xmm5", Self::Xmm6 => "xmm6", Self::Xmm7 => "xmm7",
+            Self::Xmm8 => "xmm8", Self::Xmm9 => "xmm9", Self::Xmm10 => "xmm10", Self::Xmm11 => "xmm11",
+            Self::Xmm12 => "xmm12", Self::Xmm13 => "xmm13", Self::Xmm14 => "xmm14", Self::Xmm15 => "xmm15",
+        }
+    }
 }
 
 impl X86Register {
@@ -308,6 +956,129 @@ fn emit_instruction(
             wat.push_str("          (local.set $rsp (i64.add (local.get $rsp) (i64.const 8)))\n");
             transition(wat, next);
         }
+        Mnemonic::Movsq => {
+            wat.push_str("          (block $movsq_done\n            (loop $movsq_loop\n");
+            wat.push_str("              (br_if $movsq_done (i64.eqz (local.get $rcx)))\n");
+            wat.push_str("              (i64.store (i32.wrap_i64 (local.get $rdi)) (i64.load (i32.wrap_i64 (local.get $rsi))))\n");
+            wat.push_str("              (local.set $rsi (i64.add (local.get $rsi) (i64.const 8)))\n");
+            wat.push_str("              (local.set $rdi (i64.add (local.get $rdi) (i64.const 8)))\n");
+            wat.push_str("              (local.set $rcx (i64.sub (local.get $rcx) (i64.const 1)))\n");
+            wat.push_str("              (br $movsq_loop)\n            )\n          )\n");
+            transition(wat, next);
+        }
+        Mnemonic::Pxor | Mnemonic::Xorpd | Mnemonic::Xorps | Mnemonic::Vpxor | Mnemonic::Vpxord | Mnemonic::Vpxorq | Mnemonic::Vxorpd | Mnemonic::Vxorps => {
+            let destination = xmm_destination(decoded.address, instruction, 0)?;
+            let first_source = xmm_operand(decoded.address, instruction, 1, false)?;
+            let source_index = if instruction.op_count() == 3 { 2 } else { 1 };
+            let second_source = xmm_operand(decoded.address, instruction, source_index, false)?;
+            let zeroing = if instruction.op_count() == 3 {
+                first_source == second_source
+            } else {
+                destination.read_expression() == first_source
+            };
+            if !zeroing {
+                return Err(X86ElfWasmError::UnsupportedInstruction {
+                    address: decoded.address,
+                    instruction: "PXOR/XORPD with distinct XMM registers".to_string(),
+                });
+            }
+            writeln!(wat, "          {}", write_xmm_destination(&destination, "(f64.const 0)")).unwrap();
+            transition(wat, next);
+        }
+        Mnemonic::Movq | Mnemonic::Vmovq => {
+            if instruction.op_kind(0) == OpKind::Register && xmm_register(instruction.op_register(0)).is_some() {
+                let destination = xmm_destination(decoded.address, instruction, 0)?;
+                if instruction.op_kind(1) == OpKind::Register && xmm_register(instruction.op_register(1)).is_some() {
+                    let source = xmm_operand(decoded.address, instruction, 1, false)?;
+                    writeln!(wat, "          {}", write_xmm_destination(&destination, &source)).unwrap();
+                } else {
+                    let source = operand_expr(decoded.address, instruction, 1)?;
+                    writeln!(wat, "          {}", write_xmm_destination(&destination, &format!("(f64.reinterpret_i64 {source})"))).unwrap();
+                }
+            } else if instruction.op_kind(1) == OpKind::Register && xmm_register(instruction.op_register(1)).is_some() {
+                let destination = operand_destination(decoded.address, instruction, 0)?;
+                let source = xmm_operand(decoded.address, instruction, 1, false)?;
+                writeln!(wat, "          {}", write_destination(&destination, &format!("(i64.reinterpret_f64 {source})"))).unwrap();
+            } else {
+                let destination = operand_destination(decoded.address, instruction, 0)?;
+                let source = operand_expr(decoded.address, instruction, 1)?;
+                writeln!(wat, "          {}", write_destination(&destination, &source)).unwrap();
+            }
+            transition(wat, next);
+        }
+        Mnemonic::Movsd | Mnemonic::Movss | Mnemonic::Movapd | Mnemonic::Movaps | Mnemonic::Vmovsd | Mnemonic::Vmovss | Mnemonic::Vmovapd | Mnemonic::Vmovaps => {
+            let single = matches!(instruction.mnemonic(), Mnemonic::Movss | Mnemonic::Vmovss | Mnemonic::Movaps | Mnemonic::Vmovaps);
+            let destination = xmm_destination(decoded.address, instruction, 0)?.with_scalar_kind(single);
+            let source_index = if instruction.op_count() == 3 { 2 } else { 1 };
+            let source = xmm_operand(decoded.address, instruction, source_index, single)?;
+            writeln!(wat, "          {}", write_xmm_destination(&destination, &source)).unwrap();
+            transition(wat, next);
+        }
+        Mnemonic::Addsd | Mnemonic::Subsd | Mnemonic::Mulsd | Mnemonic::Divsd
+        | Mnemonic::Addss | Mnemonic::Mulss | Mnemonic::Divss | Mnemonic::Vaddsd
+        | Mnemonic::Vsubsd | Mnemonic::Vmulsd | Mnemonic::Vdivsd | Mnemonic::Vaddss
+        | Mnemonic::Vsubss | Mnemonic::Vmulss | Mnemonic::Vdivss => {
+            let single = matches!(instruction.mnemonic(), Mnemonic::Addss | Mnemonic::Mulss | Mnemonic::Divss | Mnemonic::Vaddss | Mnemonic::Vsubss | Mnemonic::Vmulss | Mnemonic::Vdivss);
+            let destination = xmm_destination(decoded.address, instruction, 0)?;
+            let left = if instruction.op_count() == 3 {
+                xmm_operand(decoded.address, instruction, 1, single)?
+            } else {
+                destination.read_expression()
+            };
+            let right_index = if instruction.op_count() == 3 { 2 } else { 1 };
+            let right = xmm_operand(decoded.address, instruction, right_index, single)?;
+            let operation = match instruction.mnemonic() {
+                Mnemonic::Addsd | Mnemonic::Addss | Mnemonic::Vaddsd | Mnemonic::Vaddss => "add",
+                Mnemonic::Subsd | Mnemonic::Vsubsd | Mnemonic::Vsubss => "sub",
+                Mnemonic::Mulsd | Mnemonic::Mulss | Mnemonic::Vmulsd | Mnemonic::Vmulss => "mul",
+                Mnemonic::Divsd | Mnemonic::Divss | Mnemonic::Vdivsd | Mnemonic::Vdivss => "div",
+                _ => unreachable!(),
+            };
+            let value = if single {
+                format!("(f64.promote_f32 (f32.{operation} (f32.demote_f64 {left}) (f32.demote_f64 {right})))")
+            } else {
+                format!("(f64.{operation} {left} {right})")
+            };
+            writeln!(wat, "          {}", write_xmm_destination(&destination, &value)).unwrap();
+            transition(wat, next);
+        }
+        Mnemonic::Vzeroupper => transition(wat, next),
+        Mnemonic::Cvtsi2sd => {
+            let destination = xmm_destination(decoded.address, instruction, 0)?;
+            let source = operand_expr(decoded.address, instruction, 1)?;
+            let width = operand_width(instruction, 1).unwrap_or(64);
+            let signed = width_expression(&source, width, true);
+            writeln!(wat, "          {}", write_xmm_destination(&destination, &format!("(f64.convert_i64_s {signed})"))).unwrap();
+            transition(wat, next);
+        }
+        Mnemonic::Cvtsd2ss => {
+            let destination = xmm_destination(decoded.address, instruction, 0)?;
+            let source = xmm_operand(decoded.address, instruction, 1, false)?;
+            writeln!(wat, "          {}", write_xmm_destination(&destination, &format!("(f64.promote_f32 (f32.demote_f64 {source}))"))).unwrap();
+            transition(wat, next);
+        }
+        Mnemonic::Cvtss2sd => {
+            let destination = xmm_destination(decoded.address, instruction, 0)?;
+            let source = xmm_operand(decoded.address, instruction, 1, true)?;
+            writeln!(wat, "          {}", write_xmm_destination(&destination, &source)).unwrap();
+            transition(wat, next);
+        }
+        Mnemonic::Cvttsd2si => {
+            let destination = operand_destination(decoded.address, instruction, 0)?;
+            let source = xmm_operand(decoded.address, instruction, 1, false)?;
+            writeln!(wat, "          {}", write_destination(&destination, &format!("(i64.trunc_sat_f64_s {source})"))).unwrap();
+            transition(wat, next);
+        }
+        Mnemonic::Comisd | Mnemonic::Ucomisd | Mnemonic::Comiss | Mnemonic::Ucomiss
+        | Mnemonic::Vcomisd | Mnemonic::Vucomisd | Mnemonic::Vcomiss | Mnemonic::Vucomiss => {
+            let single = matches!(instruction.mnemonic(), Mnemonic::Comiss | Mnemonic::Ucomiss | Mnemonic::Vcomiss | Mnemonic::Vucomiss);
+            let left = xmm_operand(decoded.address, instruction, 0, single)?;
+            let right = xmm_operand(decoded.address, instruction, 1, single)?;
+            writeln!(wat, "          (local.set $zf (f64.eq {left} {right}))").unwrap();
+            writeln!(wat, "          (local.set $cf (f64.lt {left} {right}))").unwrap();
+            wat.push_str("          (local.set $sf (i32.const 0))\n          (local.set $pf (i32.const 0))\n");
+            transition(wat, next);
+        }
         Mnemonic::Mov | Mnemonic::Movzx | Mnemonic::Movsxd => {
             let destination = operand_destination(decoded.address, instruction, 0)?;
             let source = operand_expr(decoded.address, instruction, 1)?;
@@ -338,6 +1109,12 @@ fn emit_instruction(
                 _ => unreachable!(),
             };
             let value = format!("({op} {left} {right})");
+            writeln!(wat, "          {}", write_destination(&destination, &value)).unwrap();
+            transition(wat, next);
+        }
+        Mnemonic::Not => {
+            let destination = operand_destination(decoded.address, instruction, 0)?;
+            let value = format!("(i64.xor {} (i64.const -1))", destination.read_expression());
             writeln!(wat, "          {}", write_destination(&destination, &value)).unwrap();
             transition(wat, next);
         }
@@ -425,7 +1202,8 @@ fn emit_instruction(
             transition(wat, next);
         }
         Mnemonic::Sete | Mnemonic::Setne | Mnemonic::Setl | Mnemonic::Setle | Mnemonic::Setg
-        | Mnemonic::Setge | Mnemonic::Setb | Mnemonic::Setbe | Mnemonic::Seta | Mnemonic::Setae => {
+        | Mnemonic::Setge | Mnemonic::Setb | Mnemonic::Setbe | Mnemonic::Seta | Mnemonic::Setae
+        | Mnemonic::Setp | Mnemonic::Setnp => {
             let destination = operand_destination(decoded.address, instruction, 0)?;
             let condition = condition_expression(instruction.mnemonic()).unwrap();
             writeln!(wat, "          {}", write_destination(&destination, &format!("(if (result i64) {condition} (then (i64.const 1)) (else (i64.const 0)))"))).unwrap();
@@ -452,7 +1230,7 @@ fn emit_instruction(
         Mnemonic::Jmp => jump(wat, decoded.address, instruction.near_branch_target(), addresses)?,
         Mnemonic::Ja | Mnemonic::Jae | Mnemonic::Jb | Mnemonic::Jbe | Mnemonic::Je
         | Mnemonic::Jg | Mnemonic::Jge | Mnemonic::Jl | Mnemonic::Jle | Mnemonic::Jne
-        | Mnemonic::Js | Mnemonic::Jns => {
+        | Mnemonic::Js | Mnemonic::Jns | Mnemonic::Jp => {
             let target = branch_index(decoded.address, instruction.near_branch_target(), addresses)?;
             let condition = condition_expression(instruction.mnemonic()).unwrap();
             writeln!(wat, "          (if {condition} (then (local.set $pc (i32.const {target}))) (else (local.set $pc (i32.const {next}))))").unwrap();
@@ -492,7 +1270,7 @@ fn emit_instruction(
 fn emit_libc_call(wat: &mut String, symbol: &str) -> Result<bool, X86ElfWasmError> {
     match symbol {
         "printf" => {
-            wat.push_str("          (local.set $rax (call $doublejit_printf (local.get $rdi) (local.get $rsi) (local.get $rdx) (local.get $rcx) (local.get $r8) (local.get $r9)))\n");
+            wat.push_str("          (local.set $rax (call $doublejit_printf (local.get $rdi) (local.get $rsi) (local.get $rdx) (local.get $rcx) (local.get $r8) (local.get $r9) (local.get $xmm0) (local.get $xmm1) (local.get $xmm2) (local.get $xmm3) (local.get $xmm4) (local.get $xmm5) (local.get $xmm6) (local.get $xmm7)))\n");
         }
         "puts" => {
             wat.push_str("          (local.set $rax (call $doublejit_puts (local.get $rdi)))\n");
@@ -501,14 +1279,61 @@ fn emit_libc_call(wat: &mut String, symbol: &str) -> Result<bool, X86ElfWasmErro
             wat.push_str("          (local.get $rdi)\n          return\n");
         }
         "malloc" => {
-            wat.push_str("          (local.set $rax (i64.extend_i32_u (global.get $heap)))\n");
-            wat.push_str("          (global.set $heap (i32.add (global.get $heap) (i32.wrap_i64 (local.get $rdi))))\n");
+            wat.push_str("          (local.set $rax (call $doublejit_malloc (local.get $rdi)))\n");
         }
         "calloc" => {
-            wat.push_str("          (local.set $rax (i64.extend_i32_u (global.get $heap)))\n");
-            wat.push_str("          (global.set $heap (i32.add (global.get $heap) (i32.mul (i32.wrap_i64 (local.get $rdi)) (i32.wrap_i64 (local.get $rsi)))))\n");
+            wat.push_str("          (local.set $rax (call $doublejit_calloc (local.get $rdi) (local.get $rsi)))\n");
         }
-        "free" => wat.push_str("          (local.set $rax (i64.const 0))\n"),
+        "free" => wat.push_str("          (call $doublejit_free (local.get $rdi))\n          (local.set $rax (i64.const 0))\n"),
+        "gettimeofday" => {
+            wat.push_str("          (local.set $rax (call $doublejit_gettimeofday (local.get $rdi) (local.get $rsi)))\n");
+        }
+        "clock_gettime" => {
+            wat.push_str("          (local.set $rax (call $doublejit_clock_gettime (local.get $rdi) (local.get $rsi)))\n");
+        }
+        "fprintf" => {
+            wat.push_str("          (local.set $rax (call $doublejit_fprintf (local.get $rdi) (local.get $rsi) (local.get $rdx) (local.get $rcx) (local.get $r8) (local.get $r9) (local.get $xmm0) (local.get $xmm1) (local.get $xmm2) (local.get $xmm3) (local.get $xmm4) (local.get $xmm5) (local.get $xmm6) (local.get $xmm7)))\n");
+        }
+        "fopen" => {
+            wat.push_str("          (local.set $rax (call $doublejit_fopen (local.get $rdi) (local.get $rsi)))\n");
+        }
+        "fclose" => {
+            wat.push_str("          (local.set $rax (call $doublejit_fclose (local.get $rdi)))\n");
+        }
+        "fflush" => {
+            wat.push_str("          (local.set $rax (call $doublejit_fflush (local.get $rdi)))\n");
+        }
+        "fwrite" => {
+            wat.push_str("          (local.set $rax (call $doublejit_fwrite (local.get $rdi) (local.get $rsi) (local.get $rdx) (local.get $rcx)))\n");
+        }
+        "scanf" | "__isoc99_scanf" => {
+            wat.push_str("          (local.set $rax (call $doublejit_scanf (local.get $rdi) (local.get $rsi)))\n");
+        }
+        "atoi" => {
+            wat.push_str("          (local.set $rax (call $doublejit_atoi (local.get $rdi)))\n");
+        }
+        "putchar" => {
+            wat.push_str("          (local.set $rax (call $doublejit_putchar (local.get $rdi)))\n");
+        }
+        "open" => {
+            wat.push_str("          (local.set $rax (call $doublejit_open (local.get $rdi) (local.get $rsi) (local.get $rdx)))\n");
+        }
+        "fstat" => {
+            wat.push_str("          (local.set $rax (call $doublejit_fstat (local.get $rdi) (local.get $rsi)))\n");
+        }
+        "strerror" => {
+            wat.push_str("          (local.set $rax (call $doublejit_strerror (local.get $rdi)))\n");
+        }
+        "__errno_location" => {
+            wat.push_str("          (local.set $rax (call $doublejit_errno_location))\n");
+        }
+        "pow" => {
+            wat.push_str("          (local.set $xmm0 (call $doublejit_pow (local.get $xmm0) (local.get $xmm1)))\n");
+            wat.push_str("          (local.set $rax (i64.const 0))\n");
+        }
+        "feclearexcept" | "fetestexcept" | "fesetround" => {
+            wat.push_str("          (local.set $rax (call $doublejit_fenv_noop (local.get $rdi)))\n");
+        }
         _ => return Ok(false),
     }
     Ok(true)
@@ -558,6 +1383,8 @@ fn condition_expression(mnemonic: Mnemonic) -> Option<&'static str> {
         Mnemonic::Jl | Mnemonic::Setl => "(local.get $sf)",
         Mnemonic::Jle | Mnemonic::Setle => "(i32.or (local.get $zf) (local.get $sf))",
         Mnemonic::Jne | Mnemonic::Setne => "(i32.eqz (local.get $zf))",
+        Mnemonic::Jp | Mnemonic::Setp => "(local.get $pf)",
+        Mnemonic::Setnp => "(i32.eqz (local.get $pf))",
         Mnemonic::Js => "(local.get $sf)",
         Mnemonic::Jns => "(i32.eqz (local.get $sf))",
         _ => return None,
@@ -568,6 +1395,28 @@ fn condition_expression(mnemonic: Mnemonic) -> Option<&'static str> {
 enum Destination {
     Register { register: X86Register, width: u32 },
     Memory { address: String, width: u32 },
+}
+
+#[derive(Debug, Clone)]
+enum XmmDestination {
+    Register(XmmRegister),
+    Memory { address: String, single: bool },
+}
+
+impl XmmDestination {
+    fn with_scalar_kind(self, single: bool) -> Self {
+        match self {
+            Self::Memory { address, .. } => Self::Memory { address, single },
+            Self::Register(_) => self,
+        }
+    }
+
+    fn read_expression(&self) -> String {
+        match self {
+            Self::Register(register) => format!("(local.get ${})", register.name()),
+            Self::Memory { address, single } => read_xmm_memory(address, *single),
+        }
+    }
 }
 
 impl Destination {
@@ -590,6 +1439,59 @@ fn operand_destination(address: u64, instruction: &Instruction, index: u32) -> R
             width: instruction.memory_size().size() as u32 * 8,
         }),
         kind => Err(unsupported_operand(address, &format!("destination {kind:?}"))),
+    }
+}
+
+fn xmm_destination(
+    address: u64,
+    instruction: &Instruction,
+    index: u32,
+) -> Result<XmmDestination, X86ElfWasmError> {
+    match instruction.op_kind(index) {
+        OpKind::Register => xmm_register(instruction.op_register(index))
+            .map(XmmDestination::Register)
+            .ok_or_else(|| unsupported_operand(address, "non-XMM destination register")),
+        OpKind::Memory => Ok(XmmDestination::Memory {
+            address: memory_address(address, instruction)?,
+            single: instruction.memory_size().size() == 4,
+        }),
+        kind => Err(unsupported_operand(address, &format!("XMM destination {kind:?}"))),
+    }
+}
+
+fn xmm_operand(
+    address: u64,
+    instruction: &Instruction,
+    index: u32,
+    single: bool,
+) -> Result<String, X86ElfWasmError> {
+    match instruction.op_kind(index) {
+        OpKind::Register => xmm_register(instruction.op_register(index))
+            .map(|register| format!("(local.get ${})", register.name()))
+            .ok_or_else(|| unsupported_operand(address, "non-XMM source register")),
+        OpKind::Memory => Ok(read_xmm_memory(&memory_address(address, instruction)?, single)),
+        kind => Err(unsupported_operand(address, &format!("XMM source {kind:?}"))),
+    }
+}
+
+fn write_xmm_destination(destination: &XmmDestination, value: &str) -> String {
+    match destination {
+        XmmDestination::Register(register) => format!("(local.set ${} {value})", register.name()),
+        XmmDestination::Memory { address, single } => {
+            if *single {
+                format!("(f32.store {address} (f32.demote_f64 {value}))")
+            } else {
+                format!("(f64.store {address} {value})")
+            }
+        }
+    }
+}
+
+fn read_xmm_memory(address: &str, single: bool) -> String {
+    if single {
+        format!("(f64.promote_f32 (f32.load {address}))")
+    } else {
+        format!("(f64.load {address})")
     }
 }
 
@@ -758,6 +1660,29 @@ fn register(register: Register) -> Option<(X86Register, u32)> {
     })
 }
 
+fn xmm_register(register: Register) -> Option<XmmRegister> {
+    use Register::*;
+    Some(match register {
+        XMM0 => XmmRegister::Xmm0,
+        XMM1 => XmmRegister::Xmm1,
+        XMM2 => XmmRegister::Xmm2,
+        XMM3 => XmmRegister::Xmm3,
+        XMM4 => XmmRegister::Xmm4,
+        XMM5 => XmmRegister::Xmm5,
+        XMM6 => XmmRegister::Xmm6,
+        XMM7 => XmmRegister::Xmm7,
+        XMM8 => XmmRegister::Xmm8,
+        XMM9 => XmmRegister::Xmm9,
+        XMM10 => XmmRegister::Xmm10,
+        XMM11 => XmmRegister::Xmm11,
+        XMM12 => XmmRegister::Xmm12,
+        XMM13 => XmmRegister::Xmm13,
+        XMM14 => XmmRegister::Xmm14,
+        XMM15 => XmmRegister::Xmm15,
+        _ => return std::option::Option::None,
+    })
+}
+
 fn collect_strings(image: &X86ElfImage) -> BTreeMap<u64, String> {
     let mut strings = BTreeMap::new();
     for segment in image.segments() {
@@ -814,10 +1739,16 @@ fn unsupported_operand(address: u64, operand: &str) -> X86ElfWasmError {
     }
 }
 
-fn render_printf(format: &str, args: &[i64], strings: &BTreeMap<u64, String>) -> String {
+fn render_printf(
+    format: &str,
+    args: &[i64],
+    float_args: &[f64],
+    strings: &BTreeMap<u64, String>,
+) -> String {
     let mut output = String::new();
     let mut chars = format.chars().peekable();
     let mut arg_index = 0;
+    let mut float_index = 0;
     while let Some(character) = chars.next() {
         if character != '%' {
             output.push(character);
@@ -828,18 +1759,72 @@ fn render_printf(format: &str, args: &[i64], strings: &BTreeMap<u64, String>) ->
             output.push('%');
             continue;
         }
-        while matches!(chars.peek(), Some('l' | 'z' | 'h')) {
+        while matches!(chars.peek(), Some('-' | '+' | ' ' | '#' | '0')) {
             chars.next();
         }
-        let value = args.get(arg_index).copied().unwrap_or_default();
-        arg_index += 1;
+        while matches!(chars.peek(), Some('0'..='9')) {
+            chars.next();
+        }
+        let mut precision = None;
+        if chars.peek() == Some(&'.') {
+            chars.next();
+            let mut value = String::new();
+            while let Some('0'..='9') = chars.peek() {
+                value.push(chars.next().unwrap());
+            }
+            precision = value.parse::<usize>().ok().or(Some(0));
+        }
+        while matches!(chars.peek(), Some('l' | 'z' | 'h' | 'j' | 't' | 'L')) {
+            chars.next();
+        }
         match chars.next() {
-            Some('d') | Some('i') => output.push_str(&(value as i64).to_string()),
-            Some('u') => output.push_str(&(value as u64).to_string()),
-            Some('x') | Some('X') => output.push_str(&format!("{value:x}")),
-            Some('p') => output.push_str(&format!("0x{value:x}")),
-            Some('c') => output.push(char::from_u32(value as u32).unwrap_or('?')),
-            Some('s') => output.push_str(strings.get(&(value as u64)).map(String::as_str).unwrap_or("<unknown-string>")),
+            Some('d') | Some('i') => {
+                let value = args.get(arg_index).copied().unwrap_or_default();
+                arg_index += 1;
+                output.push_str(&value.to_string());
+            }
+            Some('u') => {
+                let value = args.get(arg_index).copied().unwrap_or_default();
+                arg_index += 1;
+                output.push_str(&(value as u64).to_string());
+            }
+            Some('x') | Some('X') => {
+                let value = args.get(arg_index).copied().unwrap_or_default();
+                arg_index += 1;
+                output.push_str(&format!("{value:x}"));
+            }
+            Some('p') => {
+                let value = args.get(arg_index).copied().unwrap_or_default();
+                arg_index += 1;
+                output.push_str(&format!("0x{value:x}"));
+            }
+            Some('c') => {
+                let value = args.get(arg_index).copied().unwrap_or_default();
+                arg_index += 1;
+                output.push(char::from_u32(value as u32).unwrap_or('?'));
+            }
+            Some('s') => {
+                let value = args.get(arg_index).copied().unwrap_or_default();
+                arg_index += 1;
+                output.push_str(strings.get(&(value as u64)).map(String::as_str).unwrap_or("<unknown-string>"));
+            }
+            Some('f') | Some('F') => {
+                let value = float_args.get(float_index).copied().unwrap_or_default();
+                float_index += 1;
+                let precision = precision.unwrap_or(6);
+                output.push_str(&format!("{value:.precision$}"));
+            }
+            Some('e') | Some('E') => {
+                let value = float_args.get(float_index).copied().unwrap_or_default();
+                float_index += 1;
+                let precision = precision.unwrap_or(6);
+                output.push_str(&format!("{value:.precision$e}"));
+            }
+            Some('g') | Some('G') => {
+                let value = float_args.get(float_index).copied().unwrap_or_default();
+                float_index += 1;
+                output.push_str(&value.to_string());
+            }
             Some(other) => {
                 output.push('%');
                 output.push(other);
@@ -857,6 +1842,9 @@ mod tests {
     #[test]
     fn renders_the_integer_libc_subset() {
         let strings = BTreeMap::from([(7, "hello".to_string())]);
-        assert_eq!(render_printf("x=%d %s\\n", &[42, 7], &strings), "x=42 hello\\n");
+        assert_eq!(
+            render_printf("x=%d %s %.2f\\n", &[42, 7], &[1.5], &strings),
+            "x=42 hello 1.50\\n"
+        );
     }
 }

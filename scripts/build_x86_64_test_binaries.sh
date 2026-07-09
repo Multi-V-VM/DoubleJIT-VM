@@ -31,13 +31,18 @@ sources=(
     test_binaries/float_test/float_test.c
     test_binaries/fstat_test/test_fstat.c
     test_binaries/sort_example/merge_sort.c
+    tests/x86_elf_sse_avx_memory.c
 )
 
 for source in "${sources[@]}"; do
     artifact="$out_dir/${source%.c}"
     mkdir -p "$(dirname "$artifact")"
     log="$artifact.build.log"
-    if "$compiler" -O0 -fno-pie -no-pie -ffreestanding -fno-builtin -nostdlib \
+    flags=()
+    if [[ "$source" == "tests/x86_elf_sse_avx_memory.c" ]]; then
+        flags+=(-mavx)
+    fi
+    if "$compiler" -O0 -fno-pie -no-pie -ffreestanding -fno-builtin -nostdlib "${flags[@]}" \
         -Wl,-e,main "$root/$source" "$stubs" -o "$artifact" >"$log" 2>&1; then
         printf '%s\t%s\tbuilt\tfreestanding x86_64 ELF with translator hostcall stubs\n' \
             "$source" "${artifact#$root/}" >> "$manifest"

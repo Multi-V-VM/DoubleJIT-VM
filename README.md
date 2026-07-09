@@ -48,7 +48,9 @@ cargo test --features ebpf
 
 For non-leaf x86_64 test programs, enable the `x86_elf` feature. This path parses an ELF image, preserves loadable data segments, models the x86 register file and stack in WASM linear memory, and dispatches direct calls, returns, and conditional branches through a translated program counter. Wasmer Singlepass then produces native code for the current host, including AArch64.
 
-The current libc hostcall ABI implements `printf`, `puts`, `exit`, `malloc`, `calloc`, and `free`. The fixture linker supplies symbol-resolvable stubs for additional C-library names so the translator can report ISA coverage independently from a host libc. Those stubs are not behavioral implementations of file I/O, scanning, time, or floating-point library routines.
+The extended WASM state machine supplies guest `argc`/`argv`, a reusable host heap, and host-backed libc adapters. The exercised ABI includes `printf`, `fprintf`, `puts`, `putchar`, `exit`, `malloc`, `calloc`, `free`, `gettimeofday`, `clock_gettime`, `fopen`, `fclose`, `fflush`, `fwrite`, `open`, `fstat`, `scanf`/`__isoc99_scanf`, `atoi`, `strerror`, `__errno_location`, and `pow`. `printf` and `fprintf` forward the six integer and eight XMM variadic argument registers; `%d`, `%i`, `%u`, `%x`, `%p`, `%c`, `%s`, `%f`, `%e`, and `%g` are implemented. Set `DOUBLEJIT_STDIN` to provide deterministic stdin for the scanning adapter.
+
+This is a host ABI bridge for translated, freestanding test ELFs, not a claim of complete POSIX/libc emulation. It deliberately rejects x87 and does not implement threads, signals, processes, dynamic linking, arbitrary variadic stack arguments, or full packed AVX state. Scalar SSE and VEX/AVX low-lane memory instructions are supported: `MOVSS/MOVSD`, `MOVAPS/MOVAPD`, `VMOVSS/VMOVSD`, `VMOVAPS/VMOVAPD`, `PXOR/XORPS/XORPD`, `VXORPS`, `MOVQ/VMOVQ`, scalar add/sub/mul/div, conversion, and `UCOMI`/`COMI` forms. 256-bit packed YMM upper lanes remain an explicit unsupported instruction class.
 
 ```bash
 # ARM build host only: install the x86_64 cross compiler once.
@@ -60,6 +62,14 @@ sudo apt-get install gcc-x86-64-linux-gnu
 # Translate and execute a real x86_64 ELF on the current host.
 cargo run --features x86_elf --example x86-elf-wasm -- \
   target/x86_64-test-binaries/test_binaries/add_test/main
+
+# The runner passes subsequent arguments as guest argv[1..].
+cargo run --features x86_elf --example x86-elf-wasm -- \
+  target/x86_64-test-binaries/test_binaries/fstat_test/test_fstat Cargo.toml
+
+# Host stdin and guest file output are both deterministic.
+DOUBLEJIT_STDIN=73 cargo run --features x86_elf --example x86-elf-wasm -- \
+  target/x86_64-test-binaries/test_binaries/archive/io_test
 
 # Separate ELF translation, Wasmer preparation, and hot execution timing.
 cargo run --features x86_elf --example x86-elf-wasm-bench -- \
@@ -76,18 +86,31 @@ Measured on the Parallels Ubuntu AArch64 guest after rebuilding the x86_64 fixtu
 
 | Workload | ELF translation | Wasmer prepare | Hot execution |
 | --- | ---: | ---: | ---: |
-| `arithmetic_test/compiled_test_arithm` | 1.459 ms | 30.658 ms | 1.319 ms/run |
+| `arithmetic_test/compiled_test_arithm` | 1.870 ms | 32.382 ms | 1.726 ms/run |
 
-All 12 C test programs with `main()` build as x86_64 ELFs. The current execution matrix is intentionally split by ISA/runtime coverage:
+All 12 original C test programs with `main()`, plus the SSE/AVX memory regression fixture, build as x86_64 ELFs. The current execution matrix is intentionally split by ISA/runtime coverage:
 
 | Programs | Result on the AArch64 path |
 | --- | --- |
 | `add_test`, `archive/hello_world` | Executed; `add_test` prints `13`, `16`, `19` and both return `0`. |
 | `arithmetic_test/compiled_test_arithm` | Executed through stack frames, calls, branches, integer memory operations, and integer divide-by-zero compatibility handling; returns `0`. |
-| `archive/io_test`, `fstat_test` | Reach the translated entry point and return `1` with no guest argv/stdin; their I/O libc routines are linkable stubs, not host I/O yet. |
-| `GCBench`, `mandelbrot`, `float_test/*`, `sort_example`, `conformance/tst-ieee754` | Rejected before execution at SSE/FP operations (`PXOR`, `MOVSS`, or `MOVSD`). |
+| `archive/io_test`, `fstat_test` | `DOUBLEJIT_STDIN=73` writes `73` to host `program.txt`; `fstat_test Cargo.toml` prints the host file metadata. Both return `0`. |
+| `GCBench`, `mandelbrot`, `float_test/f_arithm_test`, `float_test/float_test`, `sort_example` | Execute on the AArch64 path and return `0`. `GCBench` completed in 40.725 seconds in the latest full-matrix run. |
+| `float_test/f_arithm_test_stdlib` | Executes its 27 scalar floating-point checks and returns `2`: its two failures are the source program's intentional exact-equality checks for `202.105263` and `428.571429`, not a translation failure. |
+| `tests/x86_elf_sse_avx_memory` | Executes a real VEX sequence containing `vmovsd`, `vmovss`, `vmovapd`, `vmovaps`, `vaddsd`, `vmulss`, and `vucomi*`; returns `0`. |
+| `conformance/tst-ieee754` | Explicitly rejected at x87 `FLD1`, by design. |
 
 The four `.S` fixtures and `riscvminilibc.c` remain RISC-V-specific inputs, so they are recorded by the build manifest rather than falsely assembled as x86_64.
+
+### llama.cpp KV Actor Experiment
+
+The ReFlux-style KV-cache movement actor, its real x86 native baseline, and
+the corresponding x86-to-AArch64 DoubleJIT measurements are documented in
+[`docs/llama-kv-actor-experiment.md`](docs/llama-kv-actor-experiment.md).
+The same artifact includes a verified drain-and-switch live-migration run that
+snapshots and restores its 8,208-byte actor control state between AArch64
+DoubleJIT runtimes, plus crash injection before `ready`, between `ready` and
+`active`, and after `active` with exactly-once replay checks.
 ## Backend
 From WebAssembly or eBPF to the native host backend. The compiler emits architecture-neutral eBPF bytecode; the final native backend may be x86, RISC-V, or another architecture supported by the selected runtime/JIT.
 ## Comparison of WebAssembly and RISC-V

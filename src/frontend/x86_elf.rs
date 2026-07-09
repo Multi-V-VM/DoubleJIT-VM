@@ -28,6 +28,7 @@ pub struct X86ElfImage {
     segments: Vec<X86ElfSegment>,
     symbols: BTreeMap<u64, String>,
     symbol_addresses: BTreeMap<String, u64>,
+    symbol_sizes: BTreeMap<String, u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -86,6 +87,7 @@ impl X86ElfImage {
 
         let mut symbols = BTreeMap::new();
         let mut symbol_addresses = BTreeMap::new();
+        let mut symbol_sizes = BTreeMap::new();
         for symbol in &elf.syms {
             if symbol.st_value == 0 {
                 continue;
@@ -93,6 +95,7 @@ impl X86ElfImage {
             if let Some(name) = elf.strtab.get_at(symbol.st_name).filter(|name| !name.is_empty()) {
                 symbols.entry(symbol.st_value).or_insert_with(|| name.to_string());
                 symbol_addresses.entry(name.to_string()).or_insert(symbol.st_value);
+                symbol_sizes.entry(name.to_string()).or_insert(symbol.st_size);
             }
         }
 
@@ -101,6 +104,7 @@ impl X86ElfImage {
             segments,
             symbols,
             symbol_addresses,
+            symbol_sizes,
         })
     }
 
@@ -114,6 +118,14 @@ impl X86ElfImage {
 
     pub fn symbol_address(&self, name: &str) -> Option<u64> {
         self.symbol_addresses.get(name).copied()
+    }
+
+    pub fn symbol_size(&self, name: &str) -> Option<u64> {
+        self.symbol_sizes.get(name).copied()
+    }
+
+    pub fn symbol_addresses(&self) -> &BTreeMap<String, u64> {
+        &self.symbol_addresses
     }
 
     pub fn symbol_at(&self, address: u64) -> Option<&str> {
