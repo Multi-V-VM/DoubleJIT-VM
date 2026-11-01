@@ -13,6 +13,9 @@ use wasmer::{imports, Function, Instance, Module, Store, Value};
 
 const BPF_X: u8 = 0x08;
 const BPF_ADD: u8 = 0x00;
+const BPF_OR: u8 = 0x40;
+const BPF_LSH: u8 = 0x60;
+const BPF_RSH: u8 = 0x70;
 const BPF_XOR: u8 = 0xa0;
 const BPF_MOV: u8 = 0xb0;
 const BPF_EXIT: u8 = 0x90;
@@ -181,7 +184,10 @@ fn emit_alu(
     let code = instruction.code;
     let op = code & 0xf0;
     let source_is_register = code & BPF_X != 0;
-    if !matches!(op, BPF_MOV | BPF_ADD | BPF_XOR) {
+    if !matches!(
+        op,
+        BPF_MOV | BPF_ADD | BPF_XOR | BPF_OR | BPF_LSH | BPF_RSH | 0x10 | 0x50 | 0xc0
+    ) {
         return Err(EbpfWasmError::UnsupportedInstruction { index, code });
     }
 
@@ -197,8 +203,20 @@ fn emit_alu(
     }
     emit_operand(wat, instruction, source_is_register, is_32_bit);
     match (op, is_32_bit) {
+        (0x10, true) => writeln!(wat, "    i32.sub").unwrap(),
+        (0x10, false) => writeln!(wat, "    i64.sub").unwrap(),
+        (0x50, true) => writeln!(wat, "    i32.and").unwrap(),
+        (0x50, false) => writeln!(wat, "    i64.and").unwrap(),
         (BPF_ADD, true) => writeln!(wat, "    i32.add").unwrap(),
         (BPF_ADD, false) => writeln!(wat, "    i64.add").unwrap(),
+        (BPF_OR, true) => writeln!(wat, "    i32.or").unwrap(),
+        (BPF_OR, false) => writeln!(wat, "    i64.or").unwrap(),
+        (BPF_LSH, true) => writeln!(wat, "    i32.shl").unwrap(),
+        (BPF_LSH, false) => writeln!(wat, "    i64.shl").unwrap(),
+        (0xc0, true) => writeln!(wat, "    i32.shr_s").unwrap(),
+        (0xc0, false) => writeln!(wat, "    i64.shr_s").unwrap(),
+        (BPF_RSH, true) => writeln!(wat, "    i32.shr_u").unwrap(),
+        (BPF_RSH, false) => writeln!(wat, "    i64.shr_u").unwrap(),
         (BPF_XOR, true) => writeln!(wat, "    i32.xor").unwrap(),
         (BPF_XOR, false) => writeln!(wat, "    i64.xor").unwrap(),
         _ => unreachable!("the operation was checked above"),

@@ -1,0 +1,7 @@
+target,workload,source_bytes,bpf_instructions,plain_bytes,optimized_bytes,sites,execution_verified,plain_ns,optimized_ns,execution_environment
+Arm64,rotate64,2564,641,2608,1072,128,true,,,QEMU user 4.2.1 on x86_64
+Arm64,add64,516,129,560,52,1,true,,,QEMU user 4.2.1 on x86_64
+Arm64,word32,516,129,560,52,1,true,,,QEMU user 4.2.1 on x86_64
+RiscV64,rotate64,2564,641,2600,2088,128,true,,,QEMU user 4.2.1 on x86_64
+RiscV64,add64,516,129,552,52,1,true,,,QEMU user 4.2.1 on x86_64
+RiscV64,word32,516,385,2600,552,128,true,,,QEMU user 4.2.1 on x86_64

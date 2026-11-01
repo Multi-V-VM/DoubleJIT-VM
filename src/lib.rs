@@ -15,5 +15,6 @@ pub use frontend::x86::{
     DecodedX86Instruction, X86DecodeError, X86Frontend, X86Instruction, X86Mode, X86Register,
     X86Width,
 };
+#[cfg(feature = "wasm")]
 mod runtime;
 pub mod tools;

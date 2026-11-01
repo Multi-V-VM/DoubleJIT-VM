@@ -1,9 +1,9 @@
-//! Small, deterministic x86/x86_64 frontend for the eBPF-to-WASM pipeline.
+//! Restricted x86/x86_64 frontend for the eBPF pipelines.
 //!
-//! This intentionally decodes a straight-line arithmetic subset rather than
+//! This decodes arithmetic, bounded buffer access, and skip-MOV conditionals rather than
 //! pretending to execute a complete x86 userspace ABI. The supported subset is
 //! sufficient for leaf arithmetic functions and maps directly to eBPF ALU
-//! instructions: register moves, immediate moves, add-immediate, xor, and ret.
+//! instructions: moves, add-immediate, xor/or, immediate shifts, and ret.
 
 use core::fmt;
 
@@ -83,6 +83,65 @@ pub enum X86Instruction {
         dst: X86Register,
         src: X86Register,
         width: X86Width,
+    },
+    Or {
+        dst: X86Register,
+        src: X86Register,
+        width: X86Width,
+    },
+    ShiftImm {
+        dst: X86Register,
+        width: X86Width,
+        left: bool,
+        count: u8,
+    },
+    AluReg {
+        dst: X86Register,
+        src: X86Register,
+        width: X86Width,
+        op: u8,
+    },
+    AluImm {
+        dst: X86Register,
+        width: X86Width,
+        op: u8,
+        value: i32,
+    },
+    ShiftReg {
+        dst: X86Register,
+        width: X86Width,
+        left: bool,
+    },
+    Load {
+        dst: X86Register,
+        bytes: u8,
+        offset: i16,
+    },
+    Store {
+        src: X86Register,
+        bytes: u8,
+        offset: i16,
+    },
+    ByteSwap {
+        dst: X86Register,
+        width: X86Width,
+    },
+    Prefetch {
+        offset: i16,
+    },
+    CompareReg {
+        dst: X86Register,
+        src: X86Register,
+        width: X86Width,
+    },
+    CompareImm {
+        dst: X86Register,
+        width: X86Width,
+        value: i32,
+    },
+    JumpCondition {
+        condition: u8,
+        displacement: i8,
     },
     Ret,
 }
@@ -184,30 +243,114 @@ impl X86Frontend {
                 },
                 0x81 | 0x83 => {
                     let modrm = read_u8(bytes, &mut cursor, start)?;
-                    if modrm >> 6 != 0b11 || (modrm >> 3) & 0x07 != 0 {
+                    let ext = (modrm >> 3) & 7;
+                    if modrm >> 6 != 3 || !matches!(ext, 0 | 4 | 5 | 7) {
                         return Err(error(
                             start,
-                            "only ADD /0 with register operands is supported",
+                            "only register ADD/AND/SUB/CMP immediate is supported",
                         ));
                     }
-                    let immediate_len = if opcode == 0x81 { 4 } else { 1 };
-                    X86Instruction::AddImm {
-                        dst: register_from_low3(modrm & 0x07, rex & 0x01 != 0),
-                        width,
-                        value: read_signed(bytes, &mut cursor, immediate_len, start)? as i32,
+                    let value = read_signed(
+                        bytes,
+                        &mut cursor,
+                        if opcode == 0x81 { 4 } else { 1 },
+                        start,
+                    )? as i32;
+                    let dst = register_from_low3(modrm & 7, rex & 1 != 0);
+                    match ext {
+                        0 => X86Instruction::AddImm { dst, width, value },
+                        7 => X86Instruction::CompareImm { dst, width, value },
+                        _ => X86Instruction::AluImm {
+                            dst,
+                            width,
+                            value,
+                            op: if ext == 4 { 0x50 } else { 0x10 },
+                        },
                     }
                 }
-                0x31 | 0x89 | 0x8b => {
+                0xc1 | 0xd1 | 0xd3 => {
+                    let modrm = read_u8(bytes, &mut cursor, start)?;
+                    let extension = (modrm >> 3) & 7;
+                    if modrm >> 6 != 3 || !matches!(extension, 4 | 5) {
+                        return Err(error(start, "only register SHL/SHR immediate is supported"));
+                    }
+                    if opcode == 0xd3 {
+                        decoded.push(DecodedX86Instruction {
+                            offset: start,
+                            length: cursor - start,
+                            instruction: X86Instruction::ShiftReg {
+                                dst: register_from_low3(modrm & 7, rex & 1 != 0),
+                                width,
+                                left: extension == 4,
+                            },
+                        });
+                        continue;
+                    }
+                    let count = if opcode == 0xd1 {
+                        1
+                    } else {
+                        read_u8(bytes, &mut cursor, start)?
+                    };
+                    X86Instruction::ShiftImm {
+                        dst: register_from_low3(modrm & 7, rex & 1 != 0),
+                        width,
+                        left: extension == 4,
+                        count: count & if width == X86Width::W64 { 63 } else { 31 },
+                    }
+                }
+                0x01 | 0x09 | 0x21 | 0x29 | 0x31 | 0x39 | 0x89 | 0x8b => {
                     let modrm = read_u8(bytes, &mut cursor, start)?;
                     if modrm >> 6 != 0b11 {
-                        return Err(error(
-                            start,
-                            "memory operands are not supported in this frontend",
-                        ));
+                        if !matches!(opcode, 0x89 | 0x8b) {
+                            return Err(error(start, "unsupported memory operation"));
+                        }
+                        let offset =
+                            read_buffer_offset(bytes, &mut cursor, start, modrm, rex, self.mode)?;
+                        let reg = register_from_low3((modrm >> 3) & 7, rex & 4 != 0);
+                        let size = if width == X86Width::W64 { 8 } else { 4 };
+                        let instruction = if opcode == 0x8b {
+                            X86Instruction::Load {
+                                dst: reg,
+                                bytes: size,
+                                offset,
+                            }
+                        } else {
+                            X86Instruction::Store {
+                                src: reg,
+                                bytes: size,
+                                offset,
+                            }
+                        };
+                        decoded.push(DecodedX86Instruction {
+                            offset: start,
+                            length: cursor - start,
+                            instruction,
+                        });
+                        continue;
                     }
                     let rm = register_from_low3(modrm & 0x07, rex & 0x01 != 0);
                     let reg = register_from_low3((modrm >> 3) & 0x07, rex & 0x04 != 0);
                     match opcode {
+                        0x01 | 0x21 | 0x29 => X86Instruction::AluReg {
+                            dst: rm,
+                            src: reg,
+                            width,
+                            op: match opcode {
+                                0x01 => 0,
+                                0x21 => 0x50,
+                                _ => 0x10,
+                            },
+                        },
+                        0x39 => X86Instruction::CompareReg {
+                            dst: rm,
+                            src: reg,
+                            width,
+                        },
+                        0x09 => X86Instruction::Or {
+                            dst: rm,
+                            src: reg,
+                            width,
+                        },
                         0x31 => X86Instruction::Xor {
                             dst: rm,
                             src: reg,
@@ -223,6 +366,37 @@ impl X86Frontend {
                             src: rm,
                             width,
                         },
+                    }
+                }
+                0x70..=0x7f => X86Instruction::JumpCondition {
+                    condition: opcode & 15,
+                    displacement: read_u8(bytes, &mut cursor, start)? as i8,
+                },
+                0x0f => {
+                    let second = read_u8(bytes, &mut cursor, start)?;
+                    if (0xc8..=0xcf).contains(&second) {
+                        X86Instruction::ByteSwap {
+                            dst: register_from_low3(second & 7, rex & 1 != 0),
+                            width,
+                        }
+                    } else if matches!(second, 0x18 | 0xb6 | 0xb7) {
+                        let modrm = read_u8(bytes, &mut cursor, start)?;
+                        let offset =
+                            read_buffer_offset(bytes, &mut cursor, start, modrm, rex, self.mode)?;
+                        if second == 0x18 {
+                            if (modrm >> 3) & 7 != 1 {
+                                return Err(error(start, "only PREFETCHT0 is supported"));
+                            }
+                            X86Instruction::Prefetch { offset }
+                        } else {
+                            X86Instruction::Load {
+                                dst: register_from_low3((modrm >> 3) & 7, rex & 4 != 0),
+                                bytes: if second == 0xb6 { 1 } else { 2 },
+                                offset,
+                            }
+                        }
+                    } else {
+                        return Err(error(start, "unsupported 0F instruction"));
                     }
                 }
                 0xc3 => X86Instruction::Ret,
@@ -325,4 +499,27 @@ mod tests {
         ));
         assert!(matches!(decoded[2].instruction, X86Instruction::Ret));
     }
+}
+
+// The leaf memory ABI reserves RBP as a bounded buffer base; it never accepts
+// absolute, indexed, RIP-relative or guest-controlled host pointers.
+fn read_buffer_offset(
+    bytes: &[u8],
+    cursor: &mut usize,
+    start: usize,
+    modrm: u8,
+    rex: u8,
+    mode: X86Mode,
+) -> Result<i16, X86DecodeError> {
+    if mode != X86Mode::X86_64 || modrm & 7 != 5 || rex & 1 != 0 || !matches!(modrm >> 6, 1 | 2) {
+        return Err(error(
+            start,
+            "only x86-64 [rbp + nonnegative fixed offset] buffer addressing is supported",
+        ));
+    }
+    let offset = read_signed(bytes, cursor, if modrm >> 6 == 1 { 1 } else { 4 }, start)?;
+    if !(0..=i16::MAX as i64).contains(&offset) {
+        return Err(error(start, "buffer offset out of range"));
+    }
+    Ok(offset as i16)
 }

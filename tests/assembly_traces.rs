@@ -1,3 +1,5 @@
+#![cfg(feature = "wasm")]
+
 use doublejit_vm::frontend::elf::{ElfFile, SectionHeader};
 use doublejit_vm::frontend::instruction::{Instr, Instruction};
 use doublejit_vm::middleend::WasmEmitter;

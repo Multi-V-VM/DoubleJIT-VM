@@ -21,15 +21,20 @@ pub struct X86EbpfSourceMap {
     pub ebpf_index: usize,
 }
 
-/// Linux-layout eBPF generated from one straight-line x86/x86_64 leaf block.
+/// Linux-layout eBPF for the restricted leaf and bounded-buffer ABI.
 #[derive(Debug, Clone)]
 pub struct X86EbpfProgram {
     mode: X86Mode,
     instructions: Vec<bpf_insn>,
     source_map: Vec<X86EbpfSourceMap>,
+    prefetch_hints: Vec<(usize, u16)>,
 }
 
 impl X86EbpfProgram {
+    pub fn prefetch_hints(&self) -> &[(usize, u16)] {
+        &self.prefetch_hints
+    }
+
     pub fn mode(&self) -> X86Mode {
         self.mode
     }
@@ -113,7 +118,79 @@ impl X86EbpfCompiler {
         let mut instructions = Vec::with_capacity(decoded.len());
         let mut source_map = Vec::with_capacity(decoded.len());
 
-        for decoded_instruction in decoded {
+        let mut prefetch_hints = Vec::new();
+        let mut cursor = 0;
+        while cursor < decoded.len() {
+            let decoded_instruction = &decoded[cursor];
+            cursor += 1;
+            if matches!(
+                decoded_instruction.instruction,
+                X86Instruction::CompareReg { .. } | X86Instruction::CompareImm { .. }
+            ) {
+                let jump = decoded
+                    .get(cursor)
+                    .ok_or_else(|| sequence_error(decoded_instruction.offset))?;
+                let movement = decoded
+                    .get(cursor + 1)
+                    .ok_or_else(|| sequence_error(decoded_instruction.offset))?;
+                let X86Instruction::JumpCondition {
+                    condition,
+                    displacement,
+                } = jump.instruction
+                else {
+                    return Err(sequence_error(jump.offset));
+                };
+                if !matches!(
+                    movement.instruction,
+                    X86Instruction::MovReg { .. } | X86Instruction::MovImm { .. }
+                ) || jump.offset as i64 + jump.length as i64 + displacement as i64
+                    != (movement.offset + movement.length) as i64
+                {
+                    return Err(sequence_error(jump.offset));
+                }
+                let op = match condition {
+                    4 => 0x10,
+                    5 => 0x50,
+                    2 => 0xa0,
+                    3 => 0x30,
+                    6 => 0xb0,
+                    7 => 0x20,
+                    12 => 0xc0,
+                    13 => 0x70,
+                    14 => 0xd0,
+                    15 => 0x60,
+                    _ => return Err(sequence_error(jump.offset)),
+                };
+                let (dst, src, width, value, reg) = match decoded_instruction.instruction {
+                    X86Instruction::CompareReg { dst, src, width } => (dst, src, width, 0, true),
+                    X86Instruction::CompareImm { dst, width, value } => {
+                        (dst, X86Register::Rax, width, value, false)
+                    }
+                    _ => unreachable!(),
+                };
+                let ebpf_index = instructions.len();
+                instructions.push(insn(
+                    (if width == X86Width::W64 { 5 } else { 6 }) | op | if reg { 8 } else { 0 },
+                    bpf_register(decoded_instruction.offset, dst)?,
+                    if reg {
+                        bpf_register(decoded_instruction.offset, src)?
+                    } else {
+                        0
+                    },
+                    1,
+                    value,
+                ));
+                source_map.push(X86EbpfSourceMap {
+                    x86_offset: decoded_instruction.offset,
+                    x86_instruction: decoded_instruction.instruction,
+                    ebpf_index,
+                });
+                cursor += 1; // the MOV is processed in the next iteration
+                continue;
+            }
+            if let X86Instruction::Prefetch { offset } = decoded_instruction.instruction {
+                prefetch_hints.push((instructions.len(), offset as u16));
+            }
             if matches!(decoded_instruction.instruction, X86Instruction::Ret) {
                 instructions.push(insn((BPF_JMP as u8) | BPF_EXIT, 0, 0, 0, 0));
                 break;
@@ -132,6 +209,7 @@ impl X86EbpfCompiler {
             mode: self.mode,
             instructions,
             source_map,
+            prefetch_hints,
         })
     }
 }
@@ -169,6 +247,81 @@ fn lower_instruction(decoded: &DecodedX86Instruction) -> Result<bpf_insn, X86Ebp
             0,
             0,
         )),
+        X86Instruction::Or { dst, src, width } => Ok(insn(
+            alu_class(width) | 0x40 | BPF_X,
+            bpf_register(decoded.offset, dst)?,
+            bpf_register(decoded.offset, src)?,
+            0,
+            0,
+        )),
+        X86Instruction::ShiftImm {
+            dst,
+            width,
+            left,
+            count,
+        } => Ok(insn(
+            alu_class(width) | if left { 0x60 } else { 0x70 },
+            bpf_register(decoded.offset, dst)?,
+            0,
+            0,
+            i32::from(count),
+        )),
+        X86Instruction::AluReg {
+            dst,
+            src,
+            width,
+            op,
+        } => Ok(insn(
+            alu_class(width) | op | 8,
+            bpf_register(decoded.offset, dst)?,
+            bpf_register(decoded.offset, src)?,
+            0,
+            0,
+        )),
+        X86Instruction::AluImm {
+            dst,
+            width,
+            op,
+            value,
+        } => Ok(insn(
+            alu_class(width) | op,
+            bpf_register(decoded.offset, dst)?,
+            0,
+            0,
+            value,
+        )),
+        X86Instruction::ShiftReg { dst, width, left } => Ok(insn(
+            alu_class(width) | if left { 0x68 } else { 0x78 },
+            bpf_register(decoded.offset, dst)?,
+            1,
+            0,
+            0,
+        )),
+        X86Instruction::Load { dst, bytes, offset } => Ok(insn(
+            mem_size(bytes)? | 0x61,
+            bpf_register(decoded.offset, dst)?,
+            10,
+            offset,
+            0,
+        )),
+        X86Instruction::Store { src, bytes, offset } => Ok(insn(
+            mem_size(bytes)? | 0x63,
+            10,
+            bpf_register(decoded.offset, src)?,
+            offset,
+            0,
+        )),
+        X86Instruction::ByteSwap { dst, width } => Ok(insn(
+            0xdc,
+            bpf_register(decoded.offset, dst)?,
+            0,
+            0,
+            if width == X86Width::W64 { 64 } else { 32 },
+        )),
+        X86Instruction::Prefetch { .. } => Ok(insn(0x05, 0, 0, 0, 0)),
+        X86Instruction::CompareReg { .. }
+        | X86Instruction::CompareImm { .. }
+        | X86Instruction::JumpCondition { .. } => Err(sequence_error(decoded.offset)),
         X86Instruction::Ret => unreachable!("ret is emitted as the eBPF exit trailer"),
     }
 }
@@ -240,5 +393,22 @@ mod tests {
         assert_eq!(program.instructions()[1].imm, 2);
         assert_eq!(program.instructions()[2].code, (BPF_JMP as u8) | BPF_EXIT);
         assert_eq!(program.to_bytes().len(), 24);
+    }
+}
+
+fn sequence_error(offset: usize) -> X86EbpfError {
+    X86DecodeError {
+        offset,
+        reason: "only CMP followed by a forward Jcc over one MOV is supported".into(),
+    }
+    .into()
+}
+fn mem_size(bytes: u8) -> Result<u8, X86EbpfError> {
+    match bytes {
+        1 => Ok(0x10),
+        2 => Ok(8),
+        4 => Ok(0),
+        8 => Ok(0x18),
+        _ => Err(sequence_error(0)),
     }
 }

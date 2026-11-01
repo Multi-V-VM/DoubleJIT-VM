@@ -10,29 +10,33 @@ version = "0.1.0"
 aya-obj = { version = "0.2.1", optional = true, features = ["std"] }
 goblin = { version = "0.8", optional = true }
 iced-x86 = { version = "1.21", optional = true }
+memmap2 = { version = "0.9", optional = true }
+libc = { version = "0.2", optional = true }
 bytemuck = "1.9.1"
 getrandom = "0.3.4"
-wasm-bindgen = "0.2.104"
-wasm-bindgen-test = "0.3.54"
+wasm-bindgen = { version = "0.2.104", optional = true }
+wasm-bindgen-test = { version = "0.3.54", optional = true }
 # wasmer = {git = "https://github.com/Multi-V-VM/wasmer"}
-wasmer = "6.1.0"
+wasmer = { version = "6.1.0", optional = true }
 zero = "0.1.2"
-wasmer-compiler-cranelift = "6.1.0"
-wasmer-compiler-singlepass = "6.1.0"
-wasmer-wasix = "0.601.0"
-tokio = { version = "1.0", features = ["rt", "rt-multi-thread", "macros"] }
+wasmer-compiler-cranelift = { version = "6.1.0", optional = true }
+wasmer-compiler-singlepass = { version = "6.1.0", optional = true }
+wasmer-wasix = { version = "0.601.0", optional = true }
+tokio = { version = "1.0", optional = true, features = ["rt", "rt-multi-thread", "macros"] }
 
 [features]
-default = []
+default = ["wasm"]
+wasm = ["dep:wasm-bindgen", "dep:wasm-bindgen-test", "dep:wasmer", "dep:wasmer-compiler-cranelift", "dep:wasmer-compiler-singlepass", "dep:wasmer-wasix", "dep:tokio"]
 std = []
-ebpf = ["std", "dep:aya-obj"]
-x86_elf = ["ebpf", "dep:goblin", "dep:iced-x86"]
+ebpf = ["std", "dep:aya-obj", "dep:memmap2", "dep:libc"]
+x86_elf = ["wasm", "ebpf", "dep:goblin", "dep:iced-x86"]
 
 [lib]
 crate-type = ["cdylib", "rlib"]
 
 [[example]]
 name = "doublejit-runner"
+required-features = ["wasm"]
 
 [[example]]
 name = "cache_usage"
@@ -45,7 +49,16 @@ name = "optimizer_demo"
 
 [[bench]]
 name = "rvv_ebpf_avx512"
+required-features = ["wasm"]
 harness = false
 
 [package.metadata.docs.rs]
 all-features = true
+
+[[example]]
+name = "x86-ebpf-wasm"
+required-features = ["ebpf", "wasm"]
+
+[[bench]]
+name = "assembly_traces"
+required-features = ["wasm"]
